@@ -53,6 +53,11 @@ export async function setHeaderMinimized(isMinimized: boolean): Promise<void> {
   return invoke('set_header_minimized', { isMinimized });
 }
 
+export async function setPakReadyStructure(enabled: boolean): Promise<void> {
+  console.debug('[tauri] Setting pak ready structure:', enabled);
+  return invoke('set_pak_ready_structure', { enabled });
+}
+
 export async function applyWebviewUiScale(scale: number): Promise<void> {
   const tauriGlobal = (window as any).__TAURI__;
   const webviewApi = tauriGlobal?.webviewWindow;
@@ -203,4 +208,15 @@ export async function batchConvertFiles(uassetPaths: string[], basePath: string)
 export async function fetchLatestUsmap(): Promise<UsmapStatus> {
   console.debug('[tauri] Fetching latest usmap...');
   return invoke('fetch_latest_usmap');
+}
+
+export interface UpdateVfxModResult {
+  success: boolean;
+  message: string;
+  output_path?: string;
+}
+
+export async function updateVfxMod(modPath: string, usmapPath: string | null, outputDir: string): Promise<UpdateVfxModResult> {
+  console.debug('[tauri] Updating mod:', modPath, 'with usmap:', usmapPath, 'output:', outputDir);
+  return invoke('update_vfx_mod', { modPath, usmapPath, outputDir });
 }

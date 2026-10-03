@@ -83,10 +83,16 @@ pub struct AppSettings {
     pub filter_dictionary: FilterDictionary,
     #[serde(default)]
     pub is_header_minimized: bool,
+    #[serde(default = "default_true")]
+    pub pak_ready_structure: bool,
 }
 
 fn default_ui_scale() -> f64 {
     1.0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -99,6 +105,7 @@ impl Default for AppSettings {
             ui_scale: default_ui_scale(),
             filter_dictionary: FilterDictionary::default(),
             is_header_minimized: false,
+            pak_ready_structure: true,
         }
     }
 }
@@ -581,6 +588,13 @@ fn set_filter_dictionary(
 fn set_header_minimized(is_minimized: bool, state: State<AppState>) -> Result<(), String> {
     let mut settings = state.settings.lock().unwrap();
     settings.is_header_minimized = is_minimized;
+    save_settings(&settings)
+}
+
+#[tauri::command]
+fn set_pak_ready_structure(enabled: bool, state: State<AppState>) -> Result<(), String> {
+    let mut settings = state.settings.lock().unwrap();
+    settings.pak_ready_structure = enabled;
     save_settings(&settings)
 }
 
@@ -3671,6 +3685,118 @@ fn clear_manual_cache() -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateVfxModResult {
+    pub success: bool,
+    pub message: String,
+    pub output_path: Option<String>,
+}
+
+#[tauri::command]
+async fn update_vfx_mod(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mod_path: String,
+    usmap_path: Option<String>,
+    output_dir: String,
+) -> Result<UpdateVfxModResult, String> {
+    eprintln!(
+        "[DEBUG] update_vfx_mod called with mod_path={}, usmap={:?}, output_dir={}",
+        mod_path, usmap_path, output_dir
+    );
+
+    let paks_path = {
+        let settings = state.settings.lock().unwrap();
+        settings.paks_path.clone()
+    }
+    .ok_or_else(|| "Game Paks path not configured in settings. Please set it in Settings first.".to_string())?;
+
+    let effective_usmap = match usmap_path {
+        Some(ref p) if !p.trim().is_empty() => Some(p.clone()),
+        _ => {
+            let settings = state.settings.lock().unwrap();
+            settings.usmap_path.clone()
+        }
+    };
+
+    let tool_path = get_uasset_tool_path(&app);
+
+    // Create a temporary extraction directory
+    let temp_dir = tempfile::Builder::new()
+        .prefix("rvfxe-updater-")
+        .tempdir()
+        .map_err(|e| format!("Failed to create temp directory: {}", e))?;
+    let temp_extract = temp_dir.path().to_path_buf();
+
+    // Step 1: Extract legacy assets from the mod container
+    let mut extract_args = vec![
+        "extract_iostore_legacy".to_string(),
+        paks_path,
+        temp_extract.to_string_lossy().to_string(),
+        "--mod".to_string(),
+        mod_path.clone(),
+    ];
+    if let Some(ref usm) = effective_usmap {
+        extract_args.push("--usmap".to_string());
+        extract_args.push(usm.clone());
+    }
+
+    let extract_refs: Vec<&str> = extract_args.iter().map(|s| s.as_str()).collect();
+    let (stdout, stderr) = run_uasset_tool_cli(&tool_path, &extract_refs).await?;
+    eprintln!("[DEBUG] Updater extract stdout: {}", stdout);
+    if !stderr.is_empty() {
+        eprintln!("[DEBUG] Updater extract stderr: {}", stderr);
+    }
+
+    // Check if any legacy files were extracted
+    let extracted_files = find_files_recursive(&temp_extract, ".uasset");
+    if extracted_files.is_empty() {
+        return Ok(UpdateVfxModResult {
+            success: false,
+            message: format!(
+                "No packages could be extracted from mod: {}. Make sure the .utoc file is valid.",
+                mod_path
+            ),
+            output_path: None,
+        });
+    }
+
+    // Step 2: Repackage into updated mod IoStore bundle
+    let mod_file_path = Path::new(&mod_path);
+    let mod_name = mod_file_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    let target_out_dir = PathBuf::from(&output_dir);
+    fs::create_dir_all(&target_out_dir).map_err(|e| e.to_string())?;
+    let output_bundle_base = target_out_dir.join(format!("{}_Updated", mod_name));
+
+    let repack_args = vec![
+        "create_mod_iostore".to_string(),
+        output_bundle_base.to_string_lossy().to_string(),
+        temp_extract.to_string_lossy().to_string(),
+    ];
+    let repack_refs: Vec<&str> = repack_args.iter().map(|s| s.as_str()).collect();
+    let (repack_stdout, repack_stderr) = run_uasset_tool_cli(&tool_path, &repack_refs).await?;
+    eprintln!("[DEBUG] Updater repack stdout: {}", repack_stdout);
+    if !repack_stderr.is_empty() {
+        eprintln!("[DEBUG] Updater repack stderr: {}", repack_stderr);
+    }
+
+    let result_utoc = format!("{}_Updated.utoc", output_bundle_base.to_string_lossy());
+    Ok(UpdateVfxModResult {
+        success: true,
+        message: format!(
+            "Successfully updated mod with {} assets! Output created at: {}",
+            extracted_files.len(),
+            result_utoc
+        ),
+        output_path: Some(result_utoc),
+    })
+}
+
 // ============================================================================
 // APP INITIALIZATION
 // ============================================================================
@@ -3699,6 +3825,7 @@ pub fn run() {
             set_ui_scale,
             set_filter_dictionary,
             set_header_minimized,
+            set_pak_ready_structure,
             get_cache_info,
             clear_cache,
             convert_uasset_to_json,
@@ -3726,6 +3853,7 @@ pub fn run() {
             extract_manual_assets,
             get_manual_cache_info,
             clear_manual_cache,
+            update_vfx_mod,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

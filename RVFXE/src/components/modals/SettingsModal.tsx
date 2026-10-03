@@ -263,6 +263,17 @@ export function SettingsModal({
             </button>
           </div>
 
+          {/* Pak-Ready Directory Structure Toggle */}
+          <ToggleSwitch
+            label="Pak-Ready Directory Structure (Marvel/Content/...)"
+            enabled={settings.pakReadyStructure ?? true}
+            setEnabled={async (val) => {
+              console.debug('[SettingsModal] Setting pakReadyStructure:', val);
+              await tauri.setPakReadyStructure(val);
+              setSettings(prev => ({ ...prev, pakReadyStructure: val }));
+            }}
+          />
+
           {/* Auto Clear Cache Toggle */}
           <ToggleSwitch
             label="Auto Clear VFX Cache on Exit"

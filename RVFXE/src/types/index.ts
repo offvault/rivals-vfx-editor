@@ -38,6 +38,7 @@ export interface AppSettings {
   uiScale: number;
   filterDictionary?: FilterDictionary;
   isHeaderMinimized?: boolean;
+  pakReadyStructure?: boolean;
 }
 
 // ===== Cache Info =====
@@ -105,6 +106,13 @@ export interface HeroEntry {
   hero_id: string;
   display_name: string;
   icon_path: string | null;
+}
+
+export interface BatchHeroSlot {
+  slotId: string;
+  heroId: string;
+  heroName: string;
+  customLabel: string;
 }
 
 export interface HeroRosterResult {

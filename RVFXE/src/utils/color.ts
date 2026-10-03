@@ -164,3 +164,90 @@ export function applyHueShiftToRgba(
 export function isValidHex(hex: string): boolean {
   return /^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/.test(hex);
 }
+
+/**
+ * Checks whether a given parameter is an Enemy VFX parameter.
+ */
+export function isEnemyParameter(param: { paramName: string; fileName?: string; relativePath?: string }): boolean {
+  const combined = `${param.paramName} ${param.fileName || ''} ${param.relativePath || ''}`.toLowerCase();
+  return combined.includes('enemy');
+}
+
+/**
+ * Inverts the hue (+180 degrees) of an RGBA color for Enemy VFX distinction.
+ */
+export function invertColorRgba(rgba: RGBA): RGBA {
+  const isGrayscale = rgba.R === rgba.G && rgba.G === rgba.B;
+  if (isGrayscale) {
+    // For grayscale, invert intensity (1 - value)
+    const maxVal = Math.max(rgba.R, rgba.G, rgba.B, 1.0);
+    const inverted = Math.max(0, 1.0 - (rgba.R / maxVal)) * maxVal;
+    return { ...rgba, R: inverted, G: inverted, B: inverted };
+  }
+
+  return applyHueShiftToRgba(rgba, 180, false);
+}
+
+/**
+ * Generate N procedurally varied colors based on a palette of sample swatches.
+ * Ensures each file/parameter receives a unique, aesthetic variation clustered
+ * around the sample palette swatches.
+ */
+export function generateProceduralColors(
+  sampleHexes: string[],
+  count: number,
+  jitterAmount = 0.35
+): string[] {
+  if (sampleHexes.length === 0) return ['#ffffff'];
+  if (count <= 0) return [];
+
+  const validSamples = sampleHexes.filter(isValidHex);
+  const palette = validSamples.length > 0 ? validSamples : ['#3b82f6', '#10b981', '#f59e0b'];
+
+  // Convert palette to HSL
+  const hslPalette = palette.map(hex => {
+    const rgb = hexToRgba(hex);
+    return rgbToHsl(rgb.r, rgb.g, rgb.b);
+  });
+
+  const results: string[] = [];
+
+  for (let i = 0; i < count; i++) {
+    // Pick base color and neighbor for smooth interpolation
+    const palIdx = i % hslPalette.length;
+    const nextIdx = (palIdx + 1) % hslPalette.length;
+    const [h1, s1, l1] = hslPalette[palIdx];
+    const [h2, s2, l2] = hslPalette[nextIdx];
+
+    // Sub-position within segment
+    const t = Math.sin((i / count) * Math.PI * 2) * 0.5 + 0.5;
+
+    // Pseudo-random deterministic hash for jitter based on index
+    const hash = Math.sin(i * 12.9898 + 78.233) * 43758.5453;
+    const rand1 = (hash - Math.floor(hash));
+    const hash2 = Math.cos(i * 39.346 + 11.135) * 24634.63;
+    const rand2 = (hash2 - Math.floor(hash2));
+    const hash3 = Math.sin(i * 91.22 + 45.1) * 31415.92;
+    const rand3 = (hash3 - Math.floor(hash3));
+
+    // Interpolate hue with shortest circular path
+    let diffH = h2 - h1;
+    if (diffH > 0.5) diffH -= 1.0;
+    if (diffH < -0.5) diffH += 1.0;
+    let baseH = h1 + diffH * t;
+
+    // Apply controlled jitter
+    const hueJitter = (rand1 - 0.5) * jitterAmount * 0.25;
+    let finalH = baseH + hueJitter;
+    if (finalH < 0) finalH += 1;
+    if (finalH > 1) finalH -= 1;
+
+    const finalS = Math.min(1.0, Math.max(0.15, (s1 * (1 - t) + s2 * t) + (rand2 - 0.5) * jitterAmount * 0.2));
+    const finalL = Math.min(0.9, Math.max(0.15, (l1 * (1 - t) + l2 * t) + (rand3 - 0.5) * jitterAmount * 0.15));
+
+    const [r, g, b] = hslToRgb(finalH, finalS, finalL);
+    results.push(rgbaToDisplayHex(r, g, b));
+  }
+
+  return results;
+}

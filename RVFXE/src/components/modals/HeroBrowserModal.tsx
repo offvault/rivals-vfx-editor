@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import type { HeroEntry } from '@/types';
+import type { HeroEntry, BatchHeroSlot } from '@/types';
 import * as tauri from '@/services/tauri';
 
 // Module-level cache so icon data URLs persist across modal open/close cycles
@@ -9,10 +9,11 @@ const iconLoadedGlobal = new Set<string>();
 interface HeroBrowserModalProps {
   onClose: () => void;
   onSelectHero: (heroId: string, heroName: string, koMode: boolean) => void;
+  onBatchLoadHeroes?: (slots: BatchHeroSlot[], koMode: boolean) => void;
   addDebugLog: (msg: string) => void;
 }
 
-export function HeroBrowserModal({ onClose, onSelectHero, addDebugLog }: HeroBrowserModalProps) {
+export function HeroBrowserModal({ onClose, onSelectHero, onBatchLoadHeroes, addDebugLog }: HeroBrowserModalProps) {
   const [heroes, setHeroes] = useState<HeroEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -22,6 +23,8 @@ export function HeroBrowserModal({ onClose, onSelectHero, addDebugLog }: HeroBro
   const [iconDataUrls, setIconDataUrls] = useState<Record<string, string>>({ ...iconDataUrlCache });
   const [loadingIcons, setLoadingIcons] = useState(false);
   const [koMode, setKoMode] = useState(false);
+  const [isBatchMode, setIsBatchMode] = useState(false);
+  const [batchQueue, setBatchQueue] = useState<BatchHeroSlot[]>([]);
 
   // Load hero roster on mount
   useEffect(() => {
@@ -138,6 +141,32 @@ export function HeroBrowserModal({ onClose, onSelectHero, addDebugLog }: HeroBro
     }
   }, [selectedHeroId, heroes, onSelectHero, addDebugLog, koMode]);
 
+  const addToBatchQueue = (hero: HeroEntry) => {
+    const existingCount = batchQueue.filter(s => s.heroId === hero.hero_id).length;
+    const label = existingCount > 0 ? `${hero.display_name} (Variant ${existingCount + 1})` : hero.display_name;
+    setBatchQueue(prev => [
+      ...prev,
+      {
+        slotId: `${hero.hero_id}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        heroId: hero.hero_id,
+        heroName: hero.display_name,
+        customLabel: label,
+      },
+    ]);
+  };
+
+  const removeFromBatchQueue = (slotId: string) => {
+    setBatchQueue(prev => prev.filter(s => s.slotId !== slotId));
+  };
+
+  const handleBatchLoad = () => {
+    if (batchQueue.length === 0) return;
+    if (onBatchLoadHeroes) {
+      onBatchLoadHeroes(batchQueue, koMode);
+      onClose();
+    }
+  };
+
   const filteredHeroes = heroes.filter(h => {
     const term = searchTerm.toLowerCase();
     return h.display_name.toLowerCase().includes(term) || h.hero_id.includes(term);
@@ -188,8 +217,8 @@ export function HeroBrowserModal({ onClose, onSelectHero, addDebugLog }: HeroBro
           </div>
         </div>
 
-        {/* Search bar */}
-        <div className="p-4 border-b flex flex-col gap-2" style={{ borderColor: 'var(--bg-2)' }}>
+        {/* Search bar & Mode Controls */}
+        <div className="p-4 border-b flex flex-col gap-3" style={{ borderColor: 'var(--bg-2)' }}>
           <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
             <input
               type="text"
@@ -200,29 +229,134 @@ export function HeroBrowserModal({ onClose, onSelectHero, addDebugLog }: HeroBro
               style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)', color: 'var(--text-2)' }}
               autoFocus
             />
-            <div className="flex rounded-none p-1 gap-1" style={{ backgroundColor: 'var(--bg-1)' }}>
-              <button
-                onClick={() => setKoMode(false)}
-                className="px-4 py-1.5 text-xs font-semibold rounded-none transition-all duration-200"
-                style={{
-                  backgroundColor: !koMode ? 'var(--accent-main)' : 'transparent',
-                  color: !koMode ? 'var(--bg-4)' : 'var(--text-3)',
-                }}
-              >
-                VFX Materials
-              </button>
-              <button
-                onClick={() => setKoMode(true)}
-                className="px-4 py-1.5 text-xs font-semibold rounded-none transition-all duration-200"
-                style={{
-                  backgroundColor: koMode ? 'var(--accent-main)' : 'transparent',
-                  color: koMode ? 'var(--bg-4)' : 'var(--text-3)',
-                }}
-              >
-                KO Prompt (WBP)
-              </button>
+
+            <div className="flex gap-2">
+              {/* Mode Toggle: Single vs Batch */}
+              <div className="flex rounded-none p-1 gap-1" style={{ backgroundColor: 'var(--bg-1)' }}>
+                <button
+                  type="button"
+                  onClick={() => setIsBatchMode(false)}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-none transition-all duration-200"
+                  style={{
+                    backgroundColor: !isBatchMode ? 'var(--accent-main)' : 'transparent',
+                    color: !isBatchMode ? 'var(--bg-4)' : 'var(--text-3)',
+                  }}
+                >
+                  Single Hero
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsBatchMode(true)}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-none transition-all duration-200 flex items-center gap-1"
+                  style={{
+                    backgroundColor: isBatchMode ? 'var(--accent-main)' : 'transparent',
+                    color: isBatchMode ? 'var(--bg-4)' : 'var(--text-3)',
+                  }}
+                >
+                  <span>Batch Queue</span>
+                  {batchQueue.length > 0 && (
+                    <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-black text-white">
+                      {batchQueue.length}
+                    </span>
+                  )}
+                </button>
+              </div>
+
+              {/* Asset Type Toggle */}
+              <div className="flex rounded-none p-1 gap-1" style={{ backgroundColor: 'var(--bg-1)' }}>
+                <button
+                  onClick={() => setKoMode(false)}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-none transition-all duration-200"
+                  style={{
+                    backgroundColor: !koMode ? 'var(--accent-main)' : 'transparent',
+                    color: !koMode ? 'var(--bg-4)' : 'var(--text-3)',
+                  }}
+                >
+                  VFX Materials
+                </button>
+                <button
+                  onClick={() => setKoMode(true)}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-none transition-all duration-200"
+                  style={{
+                    backgroundColor: koMode ? 'var(--accent-main)' : 'transparent',
+                    color: koMode ? 'var(--bg-4)' : 'var(--text-3)',
+                  }}
+                >
+                  KO Prompt (WBP)
+                </button>
+              </div>
             </div>
           </div>
+
+          {/* Batch Queue Tray (visible when in Batch Mode) */}
+          {isBatchMode && (
+            <div className="p-3 border space-y-2" style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)' }}>
+              <div className="flex justify-between items-center">
+                <span className="text-xs font-bold uppercase tracking-wider text-[var(--accent-main)]">
+                  Queued Heroes & Variants ({batchQueue.length} slots)
+                </span>
+                {batchQueue.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setBatchQueue([])}
+                    className="text-xs opacity-60 hover:opacity-100 hover:text-red-400"
+                  >
+                    Clear All
+                  </button>
+                )}
+              </div>
+
+              {batchQueue.length === 0 ? (
+                <p className="text-xs text-center py-2" style={{ color: 'var(--text-4)' }}>
+                  Queue is empty. Click any hero card below to add them to the batch editor!
+                </p>
+              ) : (
+                <div className="flex flex-wrap gap-2 max-h-32 overflow-y-auto">
+                  {batchQueue.map((slot, idx) => (
+                    <div
+                      key={slot.slotId}
+                      className="flex items-center gap-1.5 px-2 py-1 border text-xs"
+                      style={{ backgroundColor: 'var(--bg-3)', borderColor: 'var(--accent-main)' }}
+                    >
+                      <span className="font-mono text-[10px] opacity-50">#{idx + 1}</span>
+                      <input
+                        type="text"
+                        value={slot.customLabel}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setBatchQueue(prev => prev.map(s => s.slotId === slot.slotId ? { ...s, customLabel: val } : s));
+                        }}
+                        className="bg-transparent border-b border-gray-600 focus:border-[var(--accent-main)] outline-none text-xs font-medium w-36"
+                        style={{ color: 'var(--text-1)' }}
+                        title="Edit slot label / mod name"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const hero = heroes.find(h => h.hero_id === slot.heroId);
+                          if (hero) addToBatchQueue(hero);
+                        }}
+                        title="Add duplicate variant slot for this hero"
+                        className="px-1 text-[10px] border opacity-70 hover:opacity-100"
+                        style={{ backgroundColor: 'var(--bg-1)', borderColor: 'var(--bg-1)' }}
+                      >
+                        +Var
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => removeFromBatchQueue(slot.slotId)}
+                        title="Remove slot"
+                        className="text-red-400 hover:text-red-300 font-bold ml-1"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {loadingIcons && (
             <div className="flex items-center gap-2 text-xs" style={{ color: 'var(--accent-main)' }}>
               <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><circle cx="12" cy="12" r="10" strokeDasharray="31.4 31.4" strokeDashoffset="10" /></svg>
@@ -262,23 +396,45 @@ export function HeroBrowserModal({ onClose, onSelectHero, addDebugLog }: HeroBro
           ) : (
             <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10 xl:grid-cols-12 gap-2 auto-rows-min">
               {filteredHeroes.map((hero) => {
-                const isSelected = selectedHeroId === hero.hero_id;
+                const isSingleSelected = selectedHeroId === hero.hero_id;
+                const queuedCount = batchQueue.filter(s => s.heroId === hero.hero_id).length;
+                const isSelected = isBatchMode ? queuedCount > 0 : isSingleSelected;
                 const iconDataUrl = iconDataUrls[hero.hero_id];
 
                 return (
                   <button
                     key={hero.hero_id}
-                    onClick={() => setSelectedHeroId(isSelected ? null : hero.hero_id)}
-                    onDoubleClick={() => {
-                      setSelectedHeroId(hero.hero_id);
-                      handleLoadVfx();
+                    onClick={() => {
+                      if (isBatchMode) {
+                        addToBatchQueue(hero);
+                      } else {
+                        setSelectedHeroId(isSingleSelected ? null : hero.hero_id);
+                      }
                     }}
-                    className="flex flex-col items-center p-1 transition-all duration-150 border-2 group text-xs"
+                    onDoubleClick={() => {
+                      if (isBatchMode) {
+                        addToBatchQueue(hero);
+                      } else {
+                        setSelectedHeroId(hero.hero_id);
+                        handleLoadVfx();
+                      }
+                    }}
+                    className="flex flex-col items-center p-1 transition-all duration-150 border-2 group text-xs relative"
                     style={{
                       backgroundColor: isSelected ? 'var(--bg-1)' : 'var(--bg-2)',
                       borderColor: isSelected ? 'var(--accent-main)' : 'transparent',
                     }}
                   >
+                    {/* Badge for Batch count */}
+                    {isBatchMode && queuedCount > 0 && (
+                      <div
+                        className="absolute top-1 right-1 z-30 px-1.5 py-0.5 text-[10px] font-bold rounded-full shadow"
+                        style={{ backgroundColor: 'var(--accent-main)', color: 'var(--bg-4)' }}
+                      >
+                        {queuedCount}
+                      </div>
+                    )}
+
                     {/* Icon / Placeholder */}
                     <div
                       className="w-full aspect-square mb-1 flex items-center justify-center overflow-hidden relative"
@@ -335,7 +491,16 @@ export function HeroBrowserModal({ onClose, onSelectHero, addDebugLog }: HeroBro
         {/* Footer */}
         <div className="flex items-center justify-between p-4 border-t" style={{ borderColor: 'var(--bg-2)' }}>
           <div className="text-sm" style={{ color: 'var(--text-4)' }}>
-            {selectedHeroId ? (
+            {isBatchMode ? (
+              <span>
+                Batch Queue: <strong style={{ color: 'var(--text-2)' }}>{batchQueue.length} slots</strong>
+                {batchQueue.length > 0 && (
+                  <span className="ml-1 opacity-60">
+                    ({new Set(batchQueue.map(b => b.heroId)).size} distinct heroes)
+                  </span>
+                )}
+              </span>
+            ) : selectedHeroId ? (
               <span>
                 Selected: <strong style={{ color: 'var(--text-2)' }}>
                   {heroes.find(h => h.hero_id === selectedHeroId)?.display_name}
@@ -354,14 +519,25 @@ export function HeroBrowserModal({ onClose, onSelectHero, addDebugLog }: HeroBro
             >
               Cancel
             </button>
-            <button
-              onClick={handleLoadVfx}
-              disabled={!selectedHeroId || loadingVfx}
-              className="px-6 py-2 text-sm font-medium rounded-none disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{ backgroundColor: 'var(--accent-main)', color: 'var(--bg-4)' }}
-            >
-              {loadingVfx ? 'Loading...' : koMode ? 'Load KO Prompt' : 'Load VFX Materials'}
-            </button>
+            {isBatchMode ? (
+              <button
+                onClick={handleBatchLoad}
+                disabled={batchQueue.length === 0 || loadingVfx}
+                className="px-6 py-2 text-sm font-medium rounded-none disabled:opacity-50 disabled:cursor-not-allowed"
+                style={{ backgroundColor: 'var(--accent-main)', color: 'var(--bg-4)' }}
+              >
+                {loadingVfx ? 'Loading...' : `Batch Load (${batchQueue.length} Slots)`}
+              </button>
+            ) : (
+              <button
+                onClick={handleLoadVfx}
+                disabled={!selectedHeroId || loadingVfx}
+                className="px-6 py-2 text-sm font-medium rounded-none disabled:opacity-50 disabled:cursor-not-allowed"
+                style={{ backgroundColor: 'var(--accent-main)', color: 'var(--bg-4)' }}
+              >
+                {loadingVfx ? 'Loading...' : koMode ? 'Load KO Prompt' : 'Load VFX Materials'}
+              </button>
+            )}
           </div>
         </div>
       </div>

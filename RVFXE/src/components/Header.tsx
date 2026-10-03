@@ -6,6 +6,7 @@ interface HeaderProps {
   settings: AppSettings;
   onOpenSettings: () => void;
   onOpenFilterSettings: () => void;
+  onOpenVfxUpdater?: () => void;
   onReset: () => void;
   addDebugLog: (msg: string) => void;
   onToggleMinimize: () => void;
@@ -15,6 +16,7 @@ export function Header({
   settings,
   onOpenSettings,
   onOpenFilterSettings,
+  onOpenVfxUpdater,
   onReset,
   addDebugLog,
   onToggleMinimize,
@@ -56,6 +58,20 @@ export function Header({
 
   return (
     <div className={`relative group border-2 particle-header ${isMinimized ? 'p-2' : 'p-4'}`} style={{ borderColor: 'var(--bg-2)' }}>
+      {/* VFX Updater button */}
+      {onOpenVfxUpdater && (
+        <button
+          title="Repak VFX Mod Updater"
+          onClick={onOpenVfxUpdater}
+          className="absolute top-1 p-2 rounded-full text-blue-400 hover:text-white hover:bg-blue-500/20 transition-colors z-10"
+          style={{ right: '10.5rem' }}
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+          </svg>
+        </button>
+      )}
+
       {/* Minimize button */}
       <button
         title={isMinimized ? "Maximize Header" : "Minimize Header"}

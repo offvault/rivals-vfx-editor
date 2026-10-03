@@ -3,3 +3,6 @@ export { FilterSettingsModal } from './FilterSettingsModal';
 export { ClearCacheModal } from './ClearCacheModal';
 export { ConversionProgressOverlay } from './ConversionProgressOverlay';
 export { HeroBrowserModal } from './HeroBrowserModal';
+export { AutoTwelveColorModal } from './AutoTwelveColorModal';
+export { RvfxpImportModal } from './RvfxpImportModal';
+export { VfxUpdaterModal } from './VfxUpdaterModal';

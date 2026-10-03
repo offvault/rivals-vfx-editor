@@ -1,19 +1,22 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type {
   ColorParam, RGBA, AppSettings, CacheInfo, ConversionProgress,
-  FilterDictionary, SortConfig, UassetSourceMap, FileObject, UassetFileRef, SessionEntry,
-  UsmapStatus,
+  FilterDictionary, SortConfig, UassetSourceMap, FileObject, SessionEntry,
+  UsmapStatus, BatchHeroSlot,
 } from '@/types';
-
 import { useHistory } from '@/hooks/useHistory';
 import { useDebugLog } from '@/hooks/useDebugLog';
 import { useKeyboard } from '@/hooks/useKeyboard';
-
-import { hexToRgba, applyColorToParam, applyHueShiftToRgba, rgbToHsl } from '@/utils/color';
+import {
+  hexToRgba,
+  applyColorToParam,
+  applyHueShiftToRgba,
+  rgbToHsl,
+  generateProceduralColors,
+} from '@/utils/color';
 import { setNestedValue, getFileName, normalizePath, pathsMatchSuffix } from '@/utils/helpers';
 import { parseJsonAndExtractColors } from '@/services/colorParser';
 import * as tauri from '@/services/tauri';
-
 import { Header } from '@/components/Header';
 import { DebugConsole } from '@/components/DebugConsole';
 import { GlobalControls } from '@/components/GlobalControls';
@@ -23,8 +26,15 @@ import { LumaRangeFilter } from '@/components/LumaRangeFilter';
 import { LoadFilesPanel } from '@/components/LoadFilesPanel';
 import { ManualExtractionPage } from '@/components/ManualExtractionPage';
 import { StyledPanel } from '@/components/ui';
-import { SettingsModal, FilterSettingsModal, ConversionProgressOverlay, HeroBrowserModal } from '@/components/modals';
-
+import {
+  SettingsModal,
+  FilterSettingsModal,
+  ConversionProgressOverlay,
+  HeroBrowserModal,
+  AutoTwelveColorModal,
+  RvfxpImportModal,
+  VfxUpdaterModal,
+} from '@/components/modals';
 import '../css/tailwind.min.css';
 import '../css/fonts.css';
 import '../css/style.css';
@@ -39,15 +49,37 @@ const DEFAULT_FILTER_DICTIONARY: FilterDictionary = {
   ],
 };
 
+// Isolated state for each tab / hero slot in memory
+interface HeroSlotWorkspace {
+  slotId: string;
+  heroId: string;
+  heroName: string;
+  customLabel: string;
+  koMode: boolean;
+  colorParams: ColorParam[];
+  originalFiles: Record<string, any>;
+  uassetSourceMap: UassetSourceMap;
+  selectedParams: Set<string>;
+}
+
 export function App() {
-  // === CORE STATE ===
+  // === CORE WORKSPACE STATE (FOR ACTIVE SLOT) ===
   const history = useHistory();
   const debug = useDebugLog();
-  const { colorParams, recordHistory, handleUndo, handleRedo, historyIndex, historyLength, resetHistory, setInitialHistory, getOriginalParams } = history;
+  const {
+    colorParams,
+    recordHistory,
+    handleUndo,
+    handleRedo,
+    historyIndex,
+    historyLength,
+    resetHistory,
+    setInitialHistory,
+    getOriginalParams,
+  } = history;
 
   const selectAllRef = useRef<() => void>();
   const keyboard = useKeyboard(handleUndo, handleRedo, () => selectAllRef.current?.());
-
   const [originalFiles, setOriginalFiles] = useState<Record<string, any>>({});
   const [selectedParams, setSelectedParams] = useState<Set<string>>(new Set());
   const [lastSelectedIndex, setLastSelectedIndex] = useState<number | null>(null);
@@ -65,8 +97,11 @@ export function App() {
   const [hueShiftValue, setHueShiftValue] = useState(0);
   const [hueRange, setHueRange] = useState<[number, number]>([0, 360]);
   const [lumaRange, setLumaRange] = useState<[number, number]>([0, 100]);
-  const [useFiveColors, setUseFiveColors] = useState(false);
+
+  // === DYNAMIC & PROCEDURAL SHUFFLE STATE ===
   const [shuffleColors, setShuffleColors] = useState(['#ccffff', '#88eeee', '#66dddd']);
+  const [isProceduralShuffle, setIsProceduralShuffle] = useState(false);
+  const [proceduralJitter, setProceduralJitter] = useState(0.35);
   const [brightnessMultiplier, setBrightnessMultiplier] = useState(1.0);
   const [opacityValue, setOpacityValue] = useState(1.0);
 
@@ -77,39 +112,53 @@ export function App() {
   const [sessionName, setSessionName] = useState('YourProjectName');
   const [filterDictionary, setFilterDictionary] = useState<FilterDictionary>(DEFAULT_FILTER_DICTIONARY);
 
-  // === UASSET INTEGRATION STATE ===
-  const [settings, setSettings] = useState<AppSettings>({ usmapPath: null, paksPath: null, showDetailedErrors: true, autoClearCache: false, uiScale: 1 });
+  // === CURRENT LOADED HERO TRACKING ===
+  const [currentHeroId, setCurrentHeroId] = useState<string | null>(null);
+  const [currentHeroName, setCurrentHeroName] = useState<string | null>(null);
+  const [isKoModeActive, setIsKoModeActive] = useState(false);
+
+  // === ISOLATED BATCH SLOTS WORKSPACES ===
+  const [batchSlots, setBatchSlots] = useState<HeroSlotWorkspace[]>([]);
+  const [activeSlotId, setActiveSlotId] = useState<string | null>(null);
+  const [isBatchMode, setIsBatchMode] = useState(false);
+  const [applyToAllBatch, setApplyToAllBatch] = useState(false);
+
+  // === MODALS STATE ===
+  const [settings, setSettings] = useState<AppSettings>({
+    usmapPath: null,
+    paksPath: null,
+    showDetailedErrors: true,
+    autoClearCache: false,
+    uiScale: 1,
+    pakReadyStructure: true,
+  });
   const [showHeroBrowser, setShowHeroBrowser] = useState(false);
   const [showManualExtraction, setShowManualExtraction] = useState(false);
-  const [isConverting, setIsConverting] = useState(false);
-  const [conversionProgress, setConversionProgress] = useState<ConversionProgress>({ current: 0, total: 0, fileName: '' });
   const [showSettings, setShowSettings] = useState(false);
   const [showFilterSettings, setShowFilterSettings] = useState(false);
+  const [showTwelveColorModal, setShowTwelveColorModal] = useState(false);
+  const [showVfxUpdater, setShowVfxUpdater] = useState(false);
+
+  // === SMART RVFXP IMPORT STATE ===
+  const [showRvfxpImport, setShowRvfxpImport] = useState(false);
+  const [pendingRvfxp, setPendingRvfxp] = useState<{
+    filePath: string;
+    sessionData: SessionEntry[];
+    detectedHeroId: string | null;
+    detectedHeroName: string | null;
+  } | null>(null);
+
+  // === CONVERSION & CACHE STATE ===
+  const [isConverting, setIsConverting] = useState(false);
+  const [conversionProgress, setConversionProgress] = useState<ConversionProgress>({ current: 0, total: 0, fileName: '' });
   const [heroBrowserCacheInfo, setHeroBrowserCacheInfo] = useState<CacheInfo>({ fileCount: 0, totalSizeBytes: 0 });
   const [vfxCacheInfo, setVfxCacheInfo] = useState<CacheInfo>({ fileCount: 0, totalSizeBytes: 0 });
   const [manualCacheInfo, setManualCacheInfo] = useState<CacheInfo>({ fileCount: 0, totalSizeBytes: 0 });
   const [uassetSourceMap, setUassetSourceMap] = useState<UassetSourceMap>({});
-
-  const directoryHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
-  const sessionFileInputRef = useRef<HTMLInputElement>(null);
-
-  // === USMAP MANAGEMENT STATE ===
   const [usmapStatus, setUsmapStatus] = useState<UsmapStatus | null>(null);
   const [usmapLoading, setUsmapLoading] = useState(false);
 
-  // === SHUFFLE COLORS EFFECT ===
-  useEffect(() => {
-    setShuffleColors(prev => {
-      if (useFiveColors) {
-        if (prev.length < 5) return [...prev, '#44cccc', '#22bbbb'];
-        return prev.slice(0, 5);
-      } else {
-        return prev.slice(0, 3);
-      }
-    });
-  }, [useFiveColors]);
-
-  // === CONVERSION PROGRESS LISTENER ===
+  // === PROGRESS LISTENER ===
   useEffect(() => {
     const unlistenPromise = tauri.listen('conversion-progress', (event: any) => {
       const { current, total, fileName } = event.payload;
@@ -125,246 +174,70 @@ export function App() {
         const loaded = await tauri.getSettings();
         setSettings(loaded);
         await tauri.applyWebviewUiScale(loaded.uiScale ?? 1);
-        debug.addLog(`UI scale applied: ${Math.round((loaded.uiScale ?? 1) * 100)}%`);
         if (loaded.filterDictionary) {
           setFilterDictionary(loaded.filterDictionary);
-          debug.addLog('✓ Filter dictionary loaded from settings');
-        } else {
-          setFilterDictionary(DEFAULT_FILTER_DICTIONARY);
-          debug.addLog('⚠ No dictionary in settings - using default');
         }
-        debug.addLog(`Settings loaded: usmap=${loaded.usmapPath || 'not set'}`);
       } catch (err) {
         debug.addLog(`Failed to load settings: ${err}`);
-        setFilterDictionary(DEFAULT_FILTER_DICTIONARY);
-      }
-      try {
-        const hbCache = await tauri.getHeroBrowserCacheInfo();
-        setHeroBrowserCacheInfo({ fileCount: hbCache.file_count, totalSizeBytes: hbCache.total_size_bytes });
-        const vfxCache = await tauri.getVfxCacheInfo();
-        setVfxCacheInfo({ fileCount: vfxCache.file_count, totalSizeBytes: vfxCache.total_size_bytes });
-      } catch (err) {
-        debug.addLog(`Failed to load cache info: ${err}`);
       }
     };
     loadSettings();
   }, []);
 
-  // === USMAP AUTO-MANAGEMENT ===
+  // === KEEP ACTIVE SLOT IN SYNC ===
   useEffect(() => {
-    const manageUsmap = async () => {
-      try {
-        const status = await tauri.checkUsmapStatus();
-        setUsmapStatus(status);
-        debug.addLog(`Usmap status: installed=${status.installed}, update=${status.needs_update}, file=${status.file_name || 'none'}`);
-
-        if (!status.installed || status.needs_update) {
-          debug.addLog('Usmap missing or outdated, attempting auto-update...');
-          setUsmapLoading(true);
-          try {
-            const result = await tauri.fetchLatestUsmap();
-            setUsmapStatus(result);
-            setSettings(prev => ({ ...prev, usmapPath: result.file_path }));
-            debug.addLog(`✓ Usmap auto-updated: ${result.file_name}`);
-          } catch (fetchErr) {
-            debug.addLog(`⚠ Auto-update failed: ${fetchErr}. ${status.installed ? 'Using existing mappings.' : 'Manual usmap selection required.'}`);
-          } finally {
-            setUsmapLoading(false);
-          }
-        }
-      } catch (err) {
-        debug.addLog(`Failed to check usmap status: ${err}`);
+    if (!activeSlotId || !isBatchMode) return;
+    setBatchSlots(prev => prev.map(slot => {
+      if (slot.slotId === activeSlotId) {
+        return {
+          ...slot,
+          colorParams: [...colorParams],
+          originalFiles: { ...originalFiles },
+          uassetSourceMap: { ...uassetSourceMap },
+          selectedParams: new Set(selectedParams),
+          customLabel: sessionName,
+        };
       }
-    };
-    manageUsmap();
+      return slot;
+    }));
+  }, [colorParams, originalFiles, uassetSourceMap, selectedParams, sessionName, activeSlotId, isBatchMode]);
+
+  // === DYNAMIC SHUFFLE PALETTE HANDLERS ===
+  const handleAddShuffleColor = useCallback(() => {
+    const randomHex = '#' + Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0');
+    setShuffleColors(prev => [...prev, randomHex]);
   }, []);
 
-  // === PREVENT GLOBAL DRAG/DROP NAVIGATION ===
-  useEffect(() => {
-    const preventDefault = (e: DragEvent) => e.preventDefault();
-    window.addEventListener('dragover', preventDefault);
-    window.addEventListener('drop', preventDefault);
-    return () => {
-      window.removeEventListener('dragover', preventDefault);
-      window.removeEventListener('drop', preventDefault);
-    };
+  const handleRemoveShuffleColor = useCallback((index: number) => {
+    setShuffleColors(prev => prev.filter((_, i) => i !== index));
   }, []);
 
-  // === DRAG/DROP SYSTEM LISTENER ===
-  const colorParamsRef = useRef(colorParams);
-  const processFileObjectsRef = useRef<any>(null);
-
-  useEffect(() => {
-    colorParamsRef.current = colorParams;
-  }, [colorParams]);
-
-  useEffect(() => {
-    let isMounted = true;
-    let unlistenDrop: (() => void) | null = null;
-    let unlistenEnter: (() => void) | null = null;
-    let unlistenLeave: (() => void) | null = null;
-
-    const setupListener = async () => {
-      const enter = await tauri.listen('tauri://drag-enter', () => { if (isMounted) setIsDragging(true); });
-      const leave = await tauri.listen('tauri://drag-leave', () => { if (isMounted) setIsDragging(false); });
-
-      const drop = await tauri.listen('tauri://drag-drop', async (event: any) => {
-        if (!isMounted) return;
-        setIsDragging(false);
-        const payload = event.payload;
-        const paths: string[] = payload.paths || payload;
-        if (!paths || !Array.isArray(paths) || paths.length === 0) return;
-
-        debug.addLog(`System drop detected: ${paths.length} items`);
-
-        const fileObjects: FileObject[] = [];
-        const directoryPaths: string[] = [];
-        const individualUassets: string[] = [];
-
-        for (const path of paths) {
-          try {
-            const name = path.split(/[\\/]/).pop()!;
-            if (name.endsWith('.uasset')) {
-              individualUassets.push(path);
-            } else if (name.endsWith('.json')) {
-              const content = await tauri.readTextFile(path);
-              fileObjects.push({ name, content, relativePath: name });
-            } else {
-              const metadata = await tauri.stat(path);
-              if (metadata.isDirectory) {
-                directoryPaths.push(path);
-              }
-            }
-          } catch (e) {
-            debug.addLog(`Error processing path ${path}: ${e}`);
-          }
+  const handleSetShufflePaletteCount = useCallback((count: number) => {
+    setShuffleColors(prev => {
+      if (prev.length === count) return prev;
+      if (prev.length < count) {
+        const added: string[] = [];
+        for (let i = prev.length; i < count; i++) {
+          added.push('#' + Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0'));
         }
-
-        const hasUassets = directoryPaths.length > 0 || individualUassets.length > 0;
-        if (hasUassets) {
-          setIsConverting(true);
-          setConversionProgress({ current: 0, total: 1, fileName: 'Converting dropped files...' });
-          const newSourceMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
-
-          const processResult = async (result: any, rootPath: string) => {
-            for (let i = 0; i < result.json_paths.length; i++) {
-              const jsonPath = result.json_paths[i];
-              const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
-              const uassetPath = result.uasset_paths[i] || '';
-              try {
-                const content = await tauri.readTextFile(jsonPath);
-                const parts = jsonPath.replace(/\\/g, '/').split('/');
-                const normalizedRoot = rootPath.replace(/\\/g, '/');
-                const rootName = normalizedRoot.split('/').pop() || '';
-                const rootIdx = parts.indexOf(rootName);
-                const relativePath = rootIdx >= 0
-                  ? parts.slice(rootIdx).join('/')
-                  : `${rootName}/${fileName}`;
-                fileObjects.push({ name: fileName, content, relativePath });
-                newSourceMap[relativePath] = { uassetPath, jsonPath };
-              } catch (readErr) { debug.addLog(`Error reading converted JSON: ${readErr}`); }
-            }
-          };
-
-          // Convert dropped directories
-          for (const dirPath of [...new Set(directoryPaths)]) {
-            try {
-              const result = await tauri.batchConvertDirectory(dirPath);
-              debug.addLog(`Drop batch complete: ${result.json_paths.length} JSON files from ${result.uasset_paths.length} uassets`);
-              await processResult(result, dirPath);
-            } catch (e) { debug.addLog(`Drop batch conversion failed for ${dirPath}: ${e}`); }
-          }
-
-          // Convert individually dropped .uasset files
-          if (individualUassets.length > 0) {
-            const sep = individualUassets[0].includes('/') ? '/' : '\\';
-            const basePath = individualUassets[0].substring(0, individualUassets[0].lastIndexOf(sep));
-            try {
-              const result = await tauri.batchConvertFiles(individualUassets, basePath);
-              debug.addLog(`Drop file batch complete: ${result.json_paths.length} JSON files from ${result.uasset_paths.length} uassets`);
-              await processResult(result, basePath);
-            } catch (e) { debug.addLog(`Drop file batch conversion failed: ${e}`); }
-          }
-
-          setUassetSourceMap(prev => ({ ...prev, ...newSourceMap }));
-        }
-
-        if (fileObjects.length > 0) {
-          if (hasUassets) {
-            setConversionProgress({ current: 1, total: 1, fileName: 'Extracting color parameters...' });
-            await new Promise(resolve => setTimeout(resolve, 50));
-          }
-          const currentParams = colorParamsRef.current;
-          processFileObjectsRef.current?.(fileObjects, currentParams.length > 0);
-        }
-        setIsConverting(false);
-        setConversionProgress({ current: 0, total: 0, fileName: '' });
-      });
-
-      if (isMounted) {
-        unlistenEnter = enter;
-        unlistenLeave = leave;
-        unlistenDrop = drop;
-      } else {
-        enter();
-        leave();
-        drop();
+        return [...prev, ...added];
       }
-    };
-    setupListener();
-
-    return () => {
-      isMounted = false;
-      if (unlistenDrop) unlistenDrop();
-      if (unlistenEnter) unlistenEnter();
-      if (unlistenLeave) unlistenLeave();
-    };
-  }, []);
-
-  // === PROCESS FILE OBJECTS ===
-  const processFileObjects = useCallback((fileObjects: FileObject[], append = false) => {
-    let allParams: ColorParam[] = append ? [...colorParams] : [];
-    const newOriginalFiles: Record<string, any> = append ? { ...originalFiles } : {};
-
-    fileObjects.forEach(fileObj => {
-      if (append && newOriginalFiles[fileObj.relativePath]) return;
-      try {
-        const json = JSON.parse(fileObj.content);
-        newOriginalFiles[fileObj.relativePath] = json;
-        parseJsonAndExtractColors(json, fileObj.name, fileObj.relativePath, allParams, filterDictionary, debug.addLog);
-      } catch (error) {
-        console.error('Error processing file content:', fileObj.name, error);
-        debug.addLog(`⚠ Skipped ${fileObj.name}: failed to parse (possibly outdated mappings)`);
-      }
+      return prev.slice(0, count);
     });
+  }, []);
 
-    const uniqueFolders = [...new Set(allParams.map(p => {
-      const lastSlash = p.relativePath.lastIndexOf('/');
-      return lastSlash > 0 ? p.relativePath.substring(0, lastSlash) : '/';
-    }))];
-    setFolders(uniqueFolders.sort());
-    setSelectedFolders(new Set(uniqueFolders));
-
-    if (!append) { setInitialHistory(allParams); } else { recordHistory(allParams); }
-    setOriginalFiles(newOriginalFiles);
-
-    const uniqueParamNames = [...new Set(allParams.map(p => p.paramName))].sort();
-    tauri.logUniqueParams(uniqueParamNames).catch(e => console.error('Failed to log params:', e));
-  }, [colorParams, originalFiles, filterDictionary, debug.addLog, recordHistory, setInitialHistory]);
-
-  useEffect(() => {
-    processFileObjectsRef.current = processFileObjects;
-  }, [processFileObjects]);
-
-  // === COLOR ACTIONS ===
+// === COLOR ACTIONS ===
   const handleParamChange = useCallback((id: string, newRgba: RGBA) => {
     const newParams = colorParams.map(p => (p.id === id ? { ...p, rgba: newRgba } : p));
     recordHistory(newParams);
   }, [colorParams, recordHistory]);
 
+  // === APPLY ACTIONS (WITH BATCH SYNC TOGGLE SUPPORT) ===
   const applyMasterColor = useCallback(() => {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
     const newRgba = hexToRgba(masterColor);
+
+    // Apply to current active slot
     const newParams = colorParams.map(p => {
       if (selectedParams.has(p.id)) {
         return { ...p, rgba: applyColorToParam(p.rgba, newRgba, { preserveIntensity, ignoreGrayscale }) };
@@ -372,7 +245,20 @@ export function App() {
       return p;
     });
     recordHistory(newParams);
-  }, [colorParams, selectedParams, masterColor, preserveIntensity, ignoreGrayscale, recordHistory]);
+
+    // If Sync All is checked, also update all other slots in memory
+    if (isBatchMode && applyToAllBatch && batchSlots.length > 1) {
+      setBatchSlots(prev => prev.map(s => {
+        if (s.slotId === activeSlotId) return s;
+        const updated = s.colorParams.map(p => ({
+          ...p,
+          rgba: applyColorToParam(p.rgba, newRgba, { preserveIntensity, ignoreGrayscale }),
+        }));
+        return { ...s, colorParams: updated };
+      }));
+      debug.addLog(`✓ Synced single color across all ${batchSlots.length} slots`);
+    }
+  }, [selectedParams, masterColor, colorParams, recordHistory, preserveIntensity, ignoreGrayscale, isBatchMode, applyToAllBatch, batchSlots.length, activeSlotId, debug]);
 
   const applyHueShift = useCallback(() => {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
@@ -382,38 +268,61 @@ export function App() {
     });
     recordHistory(newParams);
     setHueShiftValue(0);
-  }, [colorParams, selectedParams, hueShiftValue, ignoreGrayscale, recordHistory]);
+
+    if (isBatchMode && applyToAllBatch && batchSlots.length > 1) {
+      setBatchSlots(prev => prev.map(s => {
+        if (s.slotId === activeSlotId) return s;
+        const updated = s.colorParams.map(p => ({
+          ...p,
+          rgba: applyHueShiftToRgba(p.rgba, hueShiftValue, ignoreGrayscale),
+        }));
+        return { ...s, colorParams: updated };
+      }));
+      debug.addLog(`✓ Synced hue shift across all ${batchSlots.length} slots`);
+    }
+  }, [selectedParams, colorParams, hueShiftValue, ignoreGrayscale, recordHistory, isBatchMode, applyToAllBatch, batchSlots.length, activeSlotId, debug]);
 
   const applyShuffle = useCallback(() => {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
-    
-    // Group selected parameters by their parameter name (paramName)
-    const paramsByName: Record<string, ColorParam[]> = {};
-    colorParams.filter(p => selectedParams.has(p.id)).forEach(p => {
-      if (!paramsByName[p.paramName]) {
-        paramsByName[p.paramName] = [];
-      }
-      paramsByName[p.paramName].push(p);
-    });
-
-    const paramToColorMap: Record<string, string> = {};
-    Object.entries(paramsByName).forEach(([, params]) => {
-      // Randomize the starting index of shuffleColors per parameter name
-      const startIndex = Math.floor(Math.random() * shuffleColors.length);
-      params.forEach((param, index) => {
-        paramToColorMap[param.id] = shuffleColors[(startIndex + index) % shuffleColors.length];
+    if (isProceduralShuffle) {
+      const selectedList = colorParams.filter(p => selectedParams.has(p.id));
+      const generatedColors = generateProceduralColors(shuffleColors, selectedList.length, proceduralJitter);
+      let colorIdx = 0;
+      const newParams = colorParams.map(p => {
+        if (selectedParams.has(p.id)) {
+          const hex = generatedColors[colorIdx++];
+          return {
+            ...p,
+            rgba: applyColorToParam(p.rgba, hexToRgba(hex), { preserveIntensity, ignoreGrayscale }),
+          };
+        }
+        return p;
       });
-    });
-
-    const newParams = colorParams.map(p => {
-      if (selectedParams.has(p.id)) {
-        const newColorHex = paramToColorMap[p.id];
-        if (newColorHex) return { ...p, rgba: applyColorToParam(p.rgba, hexToRgba(newColorHex), { preserveIntensity, ignoreGrayscale }) };
-      }
-      return p;
-    });
-    recordHistory(newParams);
-  }, [colorParams, selectedParams, shuffleColors, preserveIntensity, ignoreGrayscale, recordHistory]);
+      recordHistory(newParams);
+      debug.addLog(`✓ Applied procedural shuffle (${selectedList.length} unique colors)`);
+    } else {
+      const paramsByName: Record<string, ColorParam[]> = {};
+      colorParams.filter(p => selectedParams.has(p.id)).forEach(p => {
+        if (!paramsByName[p.paramName]) paramsByName[p.paramName] = [];
+        paramsByName[p.paramName].push(p);
+      });
+      const paramToColorMap: Record<string, string> = {};
+      Object.entries(paramsByName).forEach(([, params]) => {
+        const startIndex = Math.floor(Math.random() * shuffleColors.length);
+        params.forEach((param, index) => {
+          paramToColorMap[param.id] = shuffleColors[(startIndex + index) % shuffleColors.length];
+        });
+      });
+      const newParams = colorParams.map(p => {
+        if (selectedParams.has(p.id)) {
+          const newColorHex = paramToColorMap[p.id];
+          if (newColorHex) return { ...p, rgba: applyColorToParam(p.rgba, hexToRgba(newColorHex), { preserveIntensity, ignoreGrayscale }) };
+        }
+        return p;
+      });
+      recordHistory(newParams);
+    }
+  }, [selectedParams, isProceduralShuffle, colorParams, shuffleColors, proceduralJitter, preserveIntensity, ignoreGrayscale, recordHistory, debug]);
 
   const applyBrightnessMultiplier = useCallback(() => {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
@@ -426,14 +335,14 @@ export function App() {
             R: Math.min(100, Math.max(0, p.rgba.R * brightnessMultiplier)),
             G: Math.min(100, Math.max(0, p.rgba.G * brightnessMultiplier)),
             B: Math.min(100, Math.max(0, p.rgba.B * brightnessMultiplier)),
-          }
+          },
         };
       }
       return p;
     });
     recordHistory(newParams);
     setBrightnessMultiplier(1.0);
-  }, [colorParams, selectedParams, brightnessMultiplier, recordHistory]);
+  }, [selectedParams, colorParams, brightnessMultiplier, recordHistory]);
 
   const applyOpacity = useCallback(() => {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
@@ -441,23 +350,19 @@ export function App() {
       if (selectedParams.has(p.id)) {
         return {
           ...p,
-          rgba: {
-            ...p.rgba,
-            A: Math.min(1.0, Math.max(0.0, opacityValue)),
-          }
+          rgba: { ...p.rgba, A: Math.min(1.0, Math.max(0.0, opacityValue)) },
         };
       }
       return p;
     });
     recordHistory(newParams);
     setOpacityValue(1.0);
-  }, [colorParams, selectedParams, opacityValue, recordHistory]);
+  }, [selectedParams, colorParams, opacityValue, recordHistory]);
 
   const handleResetSelected = useCallback(() => {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
     const originalParams = getOriginalParams();
     if (originalParams.length === 0) return;
-    
     let updatedCount = 0;
     const newParams = colorParams.map(p => {
       if (selectedParams.has(p.id)) {
@@ -469,16 +374,13 @@ export function App() {
       }
       return p;
     });
-    
     if (updatedCount > 0) {
       recordHistory(newParams);
       debug.addLog(`Reset ${updatedCount} parameters to original values`);
-    } else {
-      debug.addLog('Selected parameters are already at original values');
     }
-  }, [colorParams, selectedParams, getOriginalParams, recordHistory, debug.addLog]);
+  }, [selectedParams, getOriginalParams, colorParams, recordHistory, debug]);
 
-  // === SELECTION ===
+  // === FILTERING & TABLE DISPLAY ===
   const baseFilteredParams = useMemo(() => {
     let sortableParams = [...colorParams];
     if (sortConfig.key !== null && sortConfig.direction !== 'none') {
@@ -486,17 +388,10 @@ export function App() {
         if (sortConfig.key === 'color') {
           const [hA, sA, lA] = rgbToHsl(a.rgba.R, a.rgba.G, a.rgba.B);
           const [hB, sB, lB] = rgbToHsl(b.rgba.R, b.rgba.G, b.rgba.B);
-          if (hA < hB) return -1; if (hA > hB) return 1;
-          if (sA < sB) return -1; if (sA > sB) return 1;
-          if (lA < lB) return -1; if (lA > lB) return 1;
-          return 0;
+          return hA !== hB ? hA - hB : sA !== sB ? sA - sB : lA - lB;
         }
-        if (sortConfig.key === 'path') {
-          return a.relativePath.localeCompare(b.relativePath);
-        }
-        if (sortConfig.key === 'paramName') {
-          return a.paramName.localeCompare(b.paramName);
-        }
+        if (sortConfig.key === 'path') return a.relativePath.localeCompare(b.relativePath);
+        if (sortConfig.key === 'paramName') return a.paramName.localeCompare(b.paramName);
         return 0;
       });
       if (sortConfig.direction === 'descending') sortableParams.reverse();
@@ -516,25 +411,11 @@ export function App() {
       const terms = searchTerm.split(',').map(t => t.trim()).filter(Boolean);
       const positiveTerms = terms.filter(t => !t.startsWith('-'));
       const negativeTerms = terms.filter(t => t.startsWith('-')).map(t => t.slice(1).trim()).filter(Boolean);
-
-      const matchTerm = (p: ColorParam, term: string) => {
-        const isRegex = term.startsWith('/') && term.endsWith('/') && term.length > 2;
-        if (isRegex) {
-          try {
-            const regex = new RegExp(term.slice(1, -1), 'i');
-            return regex.test(p.paramName) || regex.test(p.relativePath);
-          } catch (e) {
-            // fallback to literal
-          }
-        }
-        const lowerTerm = term.toLowerCase();
-        return p.paramName.toLowerCase().includes(lowerTerm) || p.relativePath.toLowerCase().includes(lowerTerm);
-      };
-
       params = params.filter(p => {
-        const matchesPositive = positiveTerms.length === 0 || positiveTerms.some(term => matchTerm(p, term));
-        const matchesNegative = negativeTerms.length > 0 && negativeTerms.some(term => matchTerm(p, term));
-        return matchesPositive && !matchesNegative;
+        const match = (t: string) => p.paramName.toLowerCase().includes(t.toLowerCase()) || p.relativePath.toLowerCase().includes(t.toLowerCase());
+        const matchesPos = positiveTerms.length === 0 || positiveTerms.some(match);
+        const matchesNeg = negativeTerms.length > 0 && negativeTerms.some(match);
+        return matchesPos && !matchesNeg;
       });
     }
     return params;
@@ -545,7 +426,7 @@ export function App() {
     if (hueRange[0] !== 0 || hueRange[1] !== 360) {
       params = params.filter(p => {
         const [h, s] = rgbToHsl(p.rgba.R, p.rgba.G, p.rgba.B);
-        if (s < 0.05) return true; // always show grayscale
+        if (s < 0.05) return true;
         const hueDeg = h * 360;
         return hueDeg >= hueRange[0] && hueDeg <= hueRange[1];
       });
@@ -560,8 +441,6 @@ export function App() {
     return params;
   }, [baseFilteredParams, hueRange, lumaRange]);
 
-  // Drag-selecting fires this once per row crossed; a linear findIndex over
-  // ~10k params on every one of those is what makes the drag stutter.
   const paramIndexById = useMemo(() => {
     const map = new Map<string, number>();
     filteredParams.forEach((p, i) => map.set(p.id, i));
@@ -588,19 +467,14 @@ export function App() {
     setLastSelectedIndex(index);
   }, [filteredParams, paramIndexById, keyboard.shiftKey, keyboard.altKey, lastSelectedIndex]);
 
-  const filteredAssetCount = useMemo(
-    () => new Set(filteredParams.map(p => p.relativePath)).size,
-    [filteredParams]
-  );
+  const filteredAssetCount = useMemo(() => new Set(filteredParams.map(p => p.relativePath)).size, [filteredParams]);
 
   const handleSelectAll = useCallback(() => {
     if (selectedParams.size === filteredParams.length) setSelectedParams(new Set());
     else setSelectedParams(new Set(filteredParams.map(p => p.id)));
   }, [selectedParams.size, filteredParams]);
 
-  useEffect(() => {
-    selectAllRef.current = handleSelectAll;
-  }, [handleSelectAll]);
+  useEffect(() => { selectAllRef.current = handleSelectAll; }, [handleSelectAll]);
 
   const requestSort = useCallback((key: string) => {
     let direction: 'ascending' | 'descending' | 'none' = 'ascending';
@@ -612,303 +486,508 @@ export function App() {
   const handleFolderToggle = useCallback((folder: string, isAlt = false) => {
     setSelectedFolders(prev => {
       if (isAlt) return new Set([folder]);
-      const newSet = new Set(prev);
-      if (newSet.has(folder)) newSet.delete(folder); else newSet.add(folder);
-      return newSet;
+      const next = new Set(prev);
+      if (next.has(folder)) next.delete(folder); else next.add(folder);
+      return next;
     });
   }, []);
 
-  // === SAVE HANDLERS ===
-  const handleSave = useCallback(async () => {
-    if (colorParams.length === 0) { alert('No parameters to save.'); return; }
-    setSaveStatus('Saving...');
-    // Clone per file: JSON.stringify over the whole map serializes every loaded
-    // asset into a single string and exceeds V8's max string length at scale.
-    const modifiedFiles: Record<string, any> = {};
-    for (const relativePath of Object.keys(originalFiles)) {
-      modifiedFiles[relativePath] = structuredClone(originalFiles[relativePath]);
-    }
-    colorParams.forEach(param => {
-      const fileToModify = modifiedFiles[param.relativePath];
-      if (fileToModify) setNestedValue(fileToModify, param.path, param.rgba);
-    });
-    const filesToSave = new Set(Object.keys(modifiedFiles));
-    try {
-      let dirHandle = directoryHandleRef.current;
-      if (!dirHandle) { dirHandle = await (window as any).showDirectoryPicker(); directoryHandleRef.current = dirHandle; }
-      const outputDirHandle = await dirHandle!.getDirectoryHandle('output', { create: true });
-      for (const relativePath of filesToSave) {
-        const pathParts = relativePath.split('/');
-        const fileName = pathParts.pop()!;
-        let currentDirHandle = outputDirHandle;
-        for (const part of pathParts) currentDirHandle = await currentDirHandle.getDirectoryHandle(part, { create: true });
-        const fileHandle = await currentDirHandle.getFileHandle(fileName, { create: true });
-        const writable = await fileHandle.createWritable();
-        await writable.write(JSON.stringify(modifiedFiles[relativePath], null, 2));
-        await writable.close();
-      }
-      setSaveStatus(`All ${filesToSave.size} files saved to 'output' folder!`);
-    } catch (err: any) {
-      console.error('Error saving files:', err);
-      if (err.name !== 'AbortError') setSaveStatus(`Error: ${err.message}.`);
-      else setSaveStatus('Save cancelled.');
-    }
-    setTimeout(() => setSaveStatus(''), 10000);
-  }, [colorParams, originalFiles]);
+  // === INSTANT TAB SWITCHING (0 SECONDS LAG, ZERO RE-EXTRACTION) ===
+  const handleSwitchSlot = useCallback((targetSlotId: string) => {
+    if (targetSlotId === activeSlotId) return;
 
+    // 1. Commit active edits into batchSlots
+    setBatchSlots(prev => prev.map(s => {
+      if (s.slotId === activeSlotId) {
+        return {
+          ...s,
+          colorParams: [...colorParams],
+          originalFiles: { ...originalFiles },
+          uassetSourceMap: { ...uassetSourceMap },
+          selectedParams: new Set(selectedParams),
+          customLabel: sessionName,
+        };
+      }
+      return s;
+    }));
+
+    // 2. Load target slot from memory
+    const target = batchSlots.find(s => s.slotId === targetSlotId);
+    if (!target) return;
+
+    setActiveSlotId(targetSlotId);
+    setCurrentHeroId(target.heroId);
+    setCurrentHeroName(target.heroName);
+    setSessionName(target.customLabel);
+    setOriginalFiles(target.originalFiles);
+    setUassetSourceMap(target.uassetSourceMap);
+    setInitialHistory(target.colorParams);
+    setSelectedParams(new Set(target.selectedParams));
+
+    const uniqueFolders = [...new Set(target.colorParams.map(p => {
+      const lastSlash = p.relativePath.lastIndexOf('/');
+      return lastSlash > 0 ? p.relativePath.substring(0, lastSlash) : '/';
+    }))];
+    setFolders(uniqueFolders.sort());
+    setSelectedFolders(new Set(uniqueFolders));
+  }, [activeSlotId, batchSlots, colorParams, originalFiles, uassetSourceMap, selectedParams, sessionName, setInitialHistory]);
+
+  // === UP-FRONT BATCH EXTRACTION (RUNS ONCE FOR ALL QUEUED HEROES) ===
+  const handleBatchLoadHeroes = useCallback(async (slots: BatchHeroSlot[], koMode: boolean) => {
+    setShowHeroBrowser(false);
+    setIsConverting(true);
+    setIsBatchMode(true);
+    setIsKoModeActive(koMode);
+
+    try {
+      // Find all distinct hero IDs in the queue
+      const uniqueHeroIds = [...new Set(slots.map(s => s.heroId))];
+      debug.addLog(`Beginning up-front extraction for ${uniqueHeroIds.length} heroes across ${slots.length} slots...`);
+
+      const rawExtractedMap: Record<string, { fileObjs: FileObject[]; srcMap: Record<string, { uassetPath: string; jsonPath: string }> }> = {};
+
+      for (let i = 0; i < uniqueHeroIds.length; i++) {
+        const hId = uniqueHeroIds[i];
+        setConversionProgress({
+          current: i + 1,
+          total: uniqueHeroIds.length,
+          fileName: `Extracting & converting Hero ${hId} [${i + 1}/${uniqueHeroIds.length}]...`,
+        });
+
+        const res = await tauri.extractHeroVfx(hId, koMode);
+        const fileObjs: FileObject[] = [];
+        const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
+
+        for (let j = 0; j < res.json_paths.length; j++) {
+          const jsonPath = res.json_paths[j];
+          const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
+          const uassetPath = res.uasset_paths[j] || '';
+          try {
+            const content = await tauri.readTextFile(jsonPath);
+            const parts = jsonPath.replace(/\\/g, '/').split('/');
+            const customIdx = parts.findIndex(p => p === 'Custom');
+            const charsIdx = parts.findIndex(p => p === 'Characters');
+            let relativePath = '';
+            if (customIdx >= 0) relativePath = parts.slice(customIdx + 1).join('/');
+            else if (charsIdx >= 0) {
+              const heroIdx = parts.indexOf(hId, charsIdx + 1);
+              relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${hId}/${fileName}`;
+            } else {
+              const heroIdx = parts.lastIndexOf(hId);
+              relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${hId}/${fileName}`;
+            }
+            fileObjs.push({ name: fileName, content, relativePath });
+            srcMap[relativePath] = { uassetPath, jsonPath };
+          } catch (e) {}
+        }
+        rawExtractedMap[hId] = { fileObjs, srcMap };
+      }
+
+      // Initialize each slot with its own isolated memory copy
+      const preparedSlots: HeroSlotWorkspace[] = [];
+      for (const slot of slots) {
+        const raw = rawExtractedMap[slot.heroId];
+        if (!raw) continue;
+
+        const slotParams: ColorParam[] = [];
+        const slotOriginalFiles: Record<string, any> = {};
+
+        raw.fileObjs.forEach(fileObj => {
+          try {
+            const json = JSON.parse(fileObj.content);
+            slotOriginalFiles[fileObj.relativePath] = json;
+            parseJsonAndExtractColors(json, fileObj.name, fileObj.relativePath, slotParams, filterDictionary, () => {});
+          } catch (e) {}
+        });
+
+        const cleanLabel = slot.customLabel.replace(/\s+/g, '_') + (slot.customLabel.toLowerCase().includes('vfx') ? '' : '_VFX');
+
+        preparedSlots.push({
+          slotId: slot.slotId,
+          heroId: slot.heroId,
+          heroName: slot.heroName,
+          customLabel: cleanLabel,
+          koMode,
+          colorParams: slotParams,
+          originalFiles: slotOriginalFiles,
+          uassetSourceMap: { ...raw.srcMap },
+          selectedParams: new Set(slotParams.map(p => p.id)),
+        });
+      }
+
+      setBatchSlots(preparedSlots);
+
+      // Mount slot #1 immediately into the workspace
+      if (preparedSlots.length > 0) {
+        const first = preparedSlots[0];
+        setActiveSlotId(first.slotId);
+        setCurrentHeroId(first.heroId);
+        setCurrentHeroName(first.heroName);
+        setSessionName(first.customLabel);
+        setOriginalFiles(first.originalFiles);
+        setUassetSourceMap(first.uassetSourceMap);
+        setInitialHistory(first.colorParams);
+        setSelectedParams(new Set(first.selectedParams));
+
+        const uniqueFolders = [...new Set(first.colorParams.map(p => {
+          const lastSlash = p.relativePath.lastIndexOf('/');
+          return lastSlash > 0 ? p.relativePath.substring(0, lastSlash) : '/';
+        }))];
+        setFolders(uniqueFolders.sort());
+        setSelectedFolders(new Set(uniqueFolders));
+      }
+
+      debug.addLog(`✓ Batch ready! All ${preparedSlots.length} slots loaded into memory.`);
+    } catch (err: any) {
+      alert(`Batch preparation error: ${err.message || err}`);
+    } finally {
+      setIsConverting(false);
+      setConversionProgress({ current: 0, total: 0, fileName: '' });
+    }
+  }, [debug, filterDictionary, setInitialHistory]);
+
+  // === SINGLE HERO SELECT (NON-BATCH) ===
+  const handleHeroSelect = useCallback(async (heroId: string, heroName: string, koMode = false) => {
+    setShowHeroBrowser(false);
+    setIsConverting(true);
+    setIsBatchMode(false);
+    setBatchSlots([]);
+    setActiveSlotId(null);
+
+    setCurrentHeroId(heroId);
+    setCurrentHeroName(heroName);
+    setIsKoModeActive(koMode);
+
+    try {
+      const res = await tauri.extractHeroVfx(heroId, koMode);
+      const fileObjs: FileObject[] = [];
+      const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
+
+      for (let j = 0; j < res.json_paths.length; j++) {
+        const jsonPath = res.json_paths[j];
+        const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
+        const uassetPath = res.uasset_paths[j] || '';
+        try {
+          const content = await tauri.readTextFile(jsonPath);
+          const parts = jsonPath.replace(/\\/g, '/').split('/');
+          const customIdx = parts.findIndex(p => p === 'Custom');
+          const charsIdx = parts.findIndex(p => p === 'Characters');
+          let relativePath = '';
+          if (customIdx >= 0) relativePath = parts.slice(customIdx + 1).join('/');
+          else if (charsIdx >= 0) {
+            const heroIdx = parts.indexOf(heroId, charsIdx + 1);
+            relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
+          } else {
+            const heroIdx = parts.lastIndexOf(heroId);
+            relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
+          }
+          fileObjs.push({ name: fileName, content, relativePath });
+          srcMap[relativePath] = { uassetPath, jsonPath };
+        } catch (e) {}
+      }
+
+      const freshParams: ColorParam[] = [];
+      const freshFiles: Record<string, any> = {};
+      fileObjs.forEach(f => {
+        try {
+          const json = JSON.parse(f.content);
+          freshFiles[f.relativePath] = json;
+          parseJsonAndExtractColors(json, f.name, f.relativePath, freshParams, filterDictionary, debug.addLog);
+        } catch (e) {}
+      });
+
+      const cleanName = koMode ? `${heroName.replace(/\s+/g, '_')}_KO` : `${heroName.replace(/\s+/g, '_')}_VFX`;
+      setSessionName(cleanName);
+      setOriginalFiles(freshFiles);
+      setUassetSourceMap(srcMap);
+      setInitialHistory(freshParams);
+      setSelectedParams(new Set(freshParams.map(p => p.id)));
+
+      const uniqueFolders = [...new Set(freshParams.map(p => {
+        const lastSlash = p.relativePath.lastIndexOf('/');
+        return lastSlash > 0 ? p.relativePath.substring(0, lastSlash) : '/';
+      }))];
+      setFolders(uniqueFolders.sort());
+      setSelectedFolders(new Set(uniqueFolders));
+
+      debug.addLog(`Loaded ${freshParams.length} parameters for ${heroName}`);
+    } catch (err: any) {
+      alert(`Failed to load ${heroName}: ${err}`);
+    } finally {
+      setIsConverting(false);
+      setConversionProgress({ current: 0, total: 0, fileName: '' });
+    }
+  }, [debug, filterDictionary, setInitialHistory]);
+
+  // === SAVE SINGLE ACTIVE HERO (INTO ITS OWN MOD FOLDER) ===
   const handleSaveAsUasset = useCallback(async (saveAll = false) => {
     const uassetKeys = Object.keys(uassetSourceMap);
-    if (uassetKeys.length === 0) { alert('No UAsset files to save.'); return; }
-    let filesToSave: string[];
-    if (saveAll) {
-      filesToSave = uassetKeys;
-      debug.addLog(`Saving ALL ${filesToSave.length} files`);
-    } else {
-      const editedFilePaths = new Set<string>();
-      colorParams.forEach(param => {
-        const originalFile = originalFiles[param.relativePath];
-        if (!originalFile) return;
-        let originalValue: any = originalFile;
-        for (const key of param.path) {
-          if (originalValue && typeof originalValue === 'object') originalValue = originalValue[key];
-          else { originalValue = undefined; break; }
-        }
-        if (originalValue && (param.rgba.R !== originalValue.R || param.rgba.G !== originalValue.G || param.rgba.B !== originalValue.B || param.rgba.A !== originalValue.A)) {
-          editedFilePaths.add(param.relativePath);
-        }
-      });
-      filesToSave = uassetKeys.filter(key => editedFilePaths.has(key));
-      debug.addLog(`Saving ${filesToSave.length} edited files`);
-      if (filesToSave.length === 0) { alert('No edited files detected. Hold Shift and click to force save all files.'); return; }
-    }
+    if (uassetKeys.length === 0) { alert('No files loaded.'); return; }
+
     try {
-      const outputPath = await tauri.openDialog({ directory: true, multiple: false, title: 'Select folder to save .uasset files' }) as string;
+      const outputPath = await tauri.openDialog({
+        directory: true,
+        multiple: false,
+        title: 'Select Destination Folder (e.g. Done/)',
+      }) as string;
       if (!outputPath) return;
-      setSaveStatus('Saving UAsset files...');
-      setIsConverting(true);
-      setConversionProgress({ current: 0, total: filesToSave.length, fileName: 'Preparing...' });
 
-      // Only clone the files being saved, one at a time. Deep-cloning the whole
-      // originalFiles map via JSON.stringify throws RangeError: Invalid string
-      // length once enough assets are loaded (V8 caps strings at ~512MB).
-      const saveSet = new Set(filesToSave);
-      const modifiedFiles: Record<string, any> = {};
-      for (const keyPath of saveSet) {
-        const original = originalFiles[keyPath];
-        if (original !== undefined) modifiedFiles[keyPath] = structuredClone(original);
-      }
-      colorParams.forEach(param => {
-        const fileToModify = modifiedFiles[param.relativePath];
-        if (fileToModify) setNestedValue(fileToModify, param.path, param.rgba);
+      setIsConverting(true);
+      const isPakReady = settings.pakReadyStructure ?? true;
+      const cleanModFolder = sessionName.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
+
+      const filesToSave = saveAll ? uassetKeys : uassetKeys.filter(k => {
+        const orig = originalFiles[k];
+        if (!orig) return false;
+        return colorParams.some(p => p.relativePath === k);
       });
 
-      const writePromises: Promise<void>[] = [];
-      const jsonPathsForConversion: { jsonPath: string; outputName: string }[] = [];
-      let writeProgress = 0;
-      const totalToWrite = filesToSave.filter(k => uassetSourceMap[k]?.jsonPath && modifiedFiles[k]).length;
+      const modifiedFiles: Record<string, any> = {};
+      for (const k of filesToSave) {
+        if (originalFiles[k]) modifiedFiles[k] = structuredClone(originalFiles[k]);
+      }
+      colorParams.forEach(p => {
+        if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
+      });
 
+      const jsonPathsForConversion: string[] = [];
       for (const keyPath of filesToSave) {
         const sourceInfo = uassetSourceMap[keyPath];
-        if (sourceInfo && sourceInfo.jsonPath && modifiedFiles[keyPath]) {
+        if (sourceInfo?.jsonPath && modifiedFiles[keyPath]) {
           const jsonContent = JSON.stringify(modifiedFiles[keyPath], null, 2);
-          const outputRelativePath = keyPath.replace(/\.json$/i, '.uasset');
-          writePromises.push(
-            tauri.writeTextFile(sourceInfo.jsonPath, jsonContent).then(() => {
-              jsonPathsForConversion.push({ jsonPath: sourceInfo.jsonPath, outputName: outputRelativePath });
-              writeProgress++;
-              const displayName = outputRelativePath.split('/').pop();
-              setConversionProgress({ current: writeProgress, total: totalToWrite, fileName: `Preparing: ${displayName}` });
-            }).catch((err: any) => { debug.addLog(`Failed to write JSON ${keyPath}: ${err}`); writeProgress++; })
-          );
+          await tauri.writeTextFile(sourceInfo.jsonPath, jsonContent);
+
+          let outRelPath = keyPath.replace(/\.json$/i, '.uasset');
+          if (isPakReady) {
+            const heroSubPart = outRelPath.replace(/^.*Characters\//i, '').replace(/^.*Custom\//i, '');
+            outRelPath = `${cleanModFolder}/Marvel/Content/Marvel/VFX/Materials/Characters/${heroSubPart}`;
+          } else {
+            outRelPath = `${cleanModFolder}/${outRelPath}`;
+          }
+          jsonPathsForConversion.push(`${sourceInfo.jsonPath},${outRelPath}`);
         }
       }
-      await Promise.all(writePromises);
-      debug.addLog(`Wrote ${jsonPathsForConversion.length} JSON files in parallel`);
 
-      if (jsonPathsForConversion.length === 0) { alert('No JSON files were modified.'); setIsConverting(false); setSaveStatus(''); return; }
+      if (jsonPathsForConversion.length > 0) {
+        await tauri.batchConvertJsonsToUassets(jsonPathsForConversion, outputPath);
+      }
 
-      setConversionProgress({ current: 0, total: jsonPathsForConversion.length, fileName: 'Converting to UAsset...' });
-      const unlisten = await tauri.listen('conversion-progress', (event: any) => {
-        const { current, total, fileName, error } = event.payload;
-        setConversionProgress({ current, total, fileName: `${fileName || 'Converting...'}${error ? ' - ERROR' : ''}` });
-      });
-      try {
-        const invokeArgs = { jsonPaths: jsonPathsForConversion.map(f => `${f.jsonPath},${f.outputName}`), outputDir: outputPath };
-        debug.addLog(`Invoking batch_convert_jsons_to_uassets with ${invokeArgs.jsonPaths.length} files`);
-        const result = await tauri.batchConvertJsonsToUassets(invokeArgs.jsonPaths, outputPath);
-        debug.addLog(`Conversion complete: ${result.succeeded}/${result.total} succeeded`);
-        if (result.succeeded > 0) {
-          setSaveStatus(`Saved ${result.succeeded} .uasset files to output folder!`);
-          await tauri.openFolder(outputPath);
-        } else {
-          setSaveStatus('Conversion failed. Check debug log for details.');
+      // Write matching .rvfxp project profile
+      const modRoot = isPakReady ? `${outputPath}/${cleanModFolder}` : outputPath;
+      const sessionData: SessionEntry[] = colorParams.map(p => ({
+        relativePath: p.relativePath.replace(/\.json$/i, ''),
+        paramName: p.paramName,
+        rgba: p.rgba,
+      }));
+      await tauri.writeTextFile(`${modRoot}/${cleanModFolder}.rvfxp`, JSON.stringify(sessionData, null, 2));
+
+      setSaveStatus(`Saved ${cleanModFolder} successfully!`);
+      await tauri.openFolder(outputPath);
+      alert(`Success! Mod saved in:\n${outputPath}\\${cleanModFolder}`);
+    } catch (err: any) {
+      alert(`Save error: ${err.message || err}`);
+    } finally {
+      setIsConverting(false);
+      setConversionProgress({ current: 0, total: 0, fileName: '' });
+      setTimeout(() => setSaveStatus(''), 8000);
+    }
+  }, [uassetSourceMap, settings.pakReadyStructure, sessionName, originalFiles, colorParams]);
+
+  // === ⚡ BATCH SAVE ALL SLOTS (EVERY HERO GETS ITS OWN FOLDER) ===
+  const handleBatchSaveAll = useCallback(async () => {
+    if (batchSlots.length === 0) return;
+
+    try {
+      const outputPath = await tauri.openDialog({
+        directory: true,
+        multiple: false,
+        title: 'Select Destination Folder for All Mod Packs (e.g. Done/)',
+      }) as string;
+      if (!outputPath) return;
+
+      setIsConverting(true);
+      const isPakReady = settings.pakReadyStructure ?? true;
+      const totalSlots = batchSlots.length;
+
+      for (let sIdx = 0; sIdx < totalSlots; sIdx++) {
+        const slot = batchSlots[sIdx];
+        const cleanModFolder = slot.customLabel.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
+
+        setConversionProgress({
+          current: sIdx + 1,
+          total: totalSlots,
+          fileName: `[${sIdx + 1}/${totalSlots}] Exporting ${cleanModFolder}...`,
+        });
+
+        // Build modified file data for this isolated slot
+        const modifiedFiles: Record<string, any> = {};
+        for (const k of Object.keys(slot.originalFiles)) {
+          modifiedFiles[k] = structuredClone(slot.originalFiles[k]);
         }
-      } finally { unlisten(); }
-    } catch (err) {
-      debug.addLog(`Error saving UAsset files: ${err}`);
-      setSaveStatus(`Error: ${err}`);
+        slot.colorParams.forEach(p => {
+          if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
+        });
+
+        const jsonPathsForConversion: string[] = [];
+        const filesToSave = Object.keys(modifiedFiles).filter(k => slot.uassetSourceMap[k]?.jsonPath);
+
+        for (const keyPath of filesToSave) {
+          const sourceInfo = slot.uassetSourceMap[keyPath];
+          if (sourceInfo?.jsonPath) {
+            const jsonContent = JSON.stringify(modifiedFiles[keyPath], null, 2);
+            await tauri.writeTextFile(sourceInfo.jsonPath, jsonContent);
+
+            let outRelPath = keyPath.replace(/\.json$/i, '.uasset');
+            if (isPakReady) {
+              const heroSubPart = outRelPath.replace(/^.*Characters\//i, '').replace(/^.*Custom\//i, '');
+              outRelPath = `${cleanModFolder}/Marvel/Content/Marvel/VFX/Materials/Characters/${heroSubPart}`;
+            } else {
+              outRelPath = `${cleanModFolder}/${outRelPath}`;
+            }
+            jsonPathsForConversion.push(`${sourceInfo.jsonPath},${outRelPath}`);
+          }
+        }
+
+        if (jsonPathsForConversion.length > 0) {
+          await tauri.batchConvertJsonsToUassets(jsonPathsForConversion, outputPath);
+        }
+
+        // Auto-write .rvfxp file in each separate folder
+        try {
+          const modRoot = isPakReady ? `${outputPath}/${cleanModFolder}` : outputPath;
+          const sessionData: SessionEntry[] = slot.colorParams.map(p => ({
+            relativePath: p.relativePath.replace(/\.json$/i, ''),
+            paramName: p.paramName,
+            rgba: p.rgba,
+          }));
+          await tauri.writeTextFile(`${modRoot}/${cleanModFolder}.rvfxp`, JSON.stringify(sessionData, null, 2));
+        } catch (e) {}
+
+        debug.addLog(`✓ Exported ${cleanModFolder} into separate mod folder`);
+      }
+
+      setSaveStatus(`All ${totalSlots} mod packs saved!`);
+      await tauri.openFolder(outputPath);
+      alert(`Success! All ${totalSlots} mod packs exported into separate folders in:\n${outputPath}`);
+    } catch (err: any) {
+      alert(`Batch save error: ${err.message || err}`);
     } finally {
       setIsConverting(false);
       setConversionProgress({ current: 0, total: 0, fileName: '' });
       setTimeout(() => setSaveStatus(''), 10000);
     }
-  }, [colorParams, originalFiles, uassetSourceMap, debug.addLog]);
+  }, [batchSlots, settings.pakReadyStructure, debug]);
 
-  // === SELECT UASSET FOLDER ===
-  const handleSelectUassetFolder = useCallback(async () => {
-    if (!settings.usmapPath) {
-      debug.addLog('No usmap set, attempting auto-fetch...');
-      setUsmapLoading(true);
-      try {
-        const result = await tauri.fetchLatestUsmap();
-        setUsmapStatus(result);
-        setSettings(prev => ({ ...prev, usmapPath: result.file_path }));
-        debug.addLog(`✓ Usmap auto-fetched: ${result.file_name}`);
-      } catch (fetchErr) {
-        debug.addLog(`⚠ Auto-fetch failed: ${fetchErr}`);
-        setShowSettings(true);
-        setUsmapLoading(false);
-        return;
-      }
-      setUsmapLoading(false);
-    }
-    try {
-      const selectedPath = await tauri.openDialog({ directory: true, multiple: false, title: 'Select folder containing .uasset files' }) as string;
-      if (!selectedPath) return;
-      debug.addLog(`Selected folder: ${selectedPath}`);
-      setIsConverting(true);
-      setConversionProgress({ current: 0, total: 1, fileName: 'Scanning and converting...' });
-
-      const unlisten = await tauri.listen('conversion-progress', (event: any) => {
-        const { current, total, fileName, cached, error } = event.payload;
-        setConversionProgress({ current, total, fileName: `${fileName || 'Converting...'}${cached ? ' (cached)' : ''}${error ? ' - ERROR' : ''}` });
-      });
-
-      try {
-        const result = await tauri.batchConvertDirectory(selectedPath);
-        debug.addLog(`Batch conversion complete: ${result.json_paths.length} JSON files from ${result.uasset_paths.length} uassets`);
-
-        const fileObjects: FileObject[] = [];
-        const newSourceMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
-        const normalizedRoot = selectedPath.replace(/\\/g, '/');
-
-        setConversionProgress({ current: 0, total: result.json_paths.length, fileName: 'Loading converted files...' });
-
-        for (let i = 0; i < result.json_paths.length; i++) {
-          const jsonPath = result.json_paths[i];
-          const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
-          const uassetPath = result.uasset_paths[i] || '';
-
-          try {
-            const content = await tauri.readTextFile(jsonPath);
-            const parts = jsonPath.replace(/\\/g, '/').split('/');
-            // Build relative path from the root directory name
-            const rootName = normalizedRoot.split('/').pop() || '';
-            const rootIdx = parts.indexOf(rootName);
-            const relativePath = rootIdx >= 0
-              ? parts.slice(rootIdx).join('/')
-              : `${rootName}/${fileName}`;
-
-            fileObjects.push({ name: fileName, content, relativePath });
-            newSourceMap[relativePath] = { uassetPath, jsonPath };
-
-            setConversionProgress({ current: i + 1, total: result.json_paths.length, fileName });
-          } catch (readErr) {
-            debug.addLog(`Failed to read ${fileName}: ${readErr}`);
-          }
-        }
-
-        if (fileObjects.length > 0) {
-          setConversionProgress({ current: result.json_paths.length, total: result.json_paths.length, fileName: 'Extracting color parameters...' });
-          await new Promise(resolve => setTimeout(resolve, 50));
-
-          setUassetSourceMap(prev => ({ ...prev, ...newSourceMap }));
-          processFileObjects(fileObjects, colorParams.length > 0);
-          debug.addLog(`Loaded ${fileObjects.length} files into editor`);
-        } else {
-          debug.addLog('WARNING: No fileObjects to load!');
-        }
-
-        const hbCache = await tauri.getHeroBrowserCacheInfo();
-        setHeroBrowserCacheInfo({ fileCount: hbCache.file_count, totalSizeBytes: hbCache.total_size_bytes });
-        const vfxCache = await tauri.getVfxCacheInfo();
-        setVfxCacheInfo({ fileCount: vfxCache.file_count, totalSizeBytes: vfxCache.total_size_bytes });
-      } finally { unlisten(); }
-    } catch (err) {
-      debug.addLog(`⚠ Error selecting folder: ${err}`);
-    } finally {
-      setIsConverting(false);
-      setConversionProgress({ current: 0, total: 0, fileName: '' });
-    }
-  }, [settings, colorParams, debug.addLog, processFileObjects]);
-
-  // === SESSION IMPORT / EXPORT ===
-  const handleExportSession = useCallback(async () => {
-    if (selectedParams.size === 0) { alert('No parameters selected to export.'); return; }
-    const sessionData: SessionEntry[] = colorParams.filter(p => selectedParams.has(p.id)).map(p => ({
-      relativePath: p.relativePath.replace(/\.json$/i, ''), paramName: p.paramName, rgba: p.rgba,
-    }));
-    try {
-      const fileName = sessionName.endsWith('.rvfxp') ? sessionName : `${sessionName}.rvfxp`;
-      const filePath = await tauri.saveDialog({ title: 'Export Project File', defaultPath: fileName, filters: [{ name: 'RVFX Project', extensions: ['rvfxp'] }] });
-      if (!filePath) return;
-      await tauri.writeTextFile(filePath as string, JSON.stringify(sessionData, null, 2));
-      alert('Project exported successfully!');
-    } catch (err: any) { console.error('Failed to export session:', err); alert(`Failed to export session: ${err.message || err}`); }
-  }, [colorParams, selectedParams, sessionName]);
-
+  // === SMART RVFXP IMPORT FLOW ===
   const handleImportSession = useCallback(async () => {
     try {
-      const filePath = await tauri.openDialog({ title: 'Import Project File', multiple: false, filters: [{ name: 'RVFX Project', extensions: ['rvfxp', 'json'] }] });
+      const filePath = await tauri.openDialog({
+        title: 'Import Project File (.rvfxp)',
+        multiple: false,
+        filters: [{ name: 'RVFX Project', extensions: ['rvfxp', 'json'] }],
+      });
       if (!filePath) return;
       const content = await tauri.readTextFile(filePath as string);
       const sessionData: SessionEntry[] = JSON.parse(content);
       if (!Array.isArray(sessionData)) { alert('Invalid project file format.'); return; }
-      debug.addLog(`Importing project with ${sessionData.length} entries`);
-      let updatedCount = 0;
-      const newColorParams = colorParams.map(param => {
-        const paramNormalizedPath = normalizePath(param.relativePath);
-        const paramFileName = getFileName(param.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, '');
-        let matchingEntry = sessionData.find(entry => normalizePath(entry.relativePath) === paramNormalizedPath && entry.paramName === param.paramName);
-        if (!matchingEntry) matchingEntry = sessionData.find(entry => pathsMatchSuffix(normalizePath(entry.relativePath), paramNormalizedPath) && entry.paramName === param.paramName);
-        if (!matchingEntry) matchingEntry = sessionData.find(entry => { const fn = getFileName(entry.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, ''); return fn === paramFileName && entry.paramName === param.paramName; });
-        if (matchingEntry?.rgba) {
-          updatedCount++;
-          return { ...param, rgba: { R: matchingEntry.rgba.R ?? param.rgba.R, G: matchingEntry.rgba.G ?? param.rgba.G, B: matchingEntry.rgba.B ?? param.rgba.B, A: matchingEntry.rgba.A ?? param.rgba.A } };
-        }
-        return param;
+
+      let detectedHeroId: string | null = null;
+      for (const entry of sessionData) {
+        const m = entry.relativePath.match(/(?:Characters|Custom)[\\/](\d{4})/i) || entry.relativePath.match(/^(\d{4})[\\/]/);
+        if (m) { detectedHeroId = m[1]; break; }
+      }
+
+      let detectedHeroName: string | null = null;
+      if (detectedHeroId) {
+        try {
+          const roster = await tauri.getHeroRoster(false);
+          const hero = roster.heroes.find(h => h.hero_id === detectedHeroId);
+          if (hero) detectedHeroName = hero.display_name;
+        } catch (e) {}
+      }
+
+      setPendingRvfxp({
+        filePath: filePath as string,
+        sessionData,
+        detectedHeroId,
+        detectedHeroName,
       });
-      recordHistory(newColorParams);
-      debug.addLog(`Updated ${updatedCount} parameters from import`);
-      alert(updatedCount > 0 ? `Project imported successfully! ${updatedCount} parameters were updated.` : 'Project file loaded but no matching parameters found.');
-    } catch (err: any) { console.error('Failed to import session:', err); alert(`Failed to import session: ${err.message || err}`); }
-  }, [colorParams, debug.addLog, recordHistory]);
+      setShowRvfxpImport(true);
+    } catch (err: any) {
+      alert(`Failed to import session: ${err.message || err}`);
+    }
+  }, []);
 
-  // === FILTER DICTIONARY ===
-  const handleFilterDictionaryChange = useCallback(async (newDictionary: FilterDictionary) => {
-    setFilterDictionary(newDictionary);
+  const applyRvfxpToLoadedParams = useCallback((sessionData: SessionEntry[]) => {
+    let updatedCount = 0;
+    const newColorParams = colorParams.map(param => {
+      const paramNorm = normalizePath(param.relativePath);
+      const paramFileName = getFileName(param.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, '');
+      let match = sessionData.find(e => normalizePath(e.relativePath) === paramNorm && e.paramName === param.paramName);
+      if (!match) match = sessionData.find(e => pathsMatchSuffix(normalizePath(e.relativePath), paramNorm) && e.paramName === param.paramName);
+      if (!match) match = sessionData.find(e => getFileName(e.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, '') === paramFileName && e.paramName === param.paramName);
+      if (match?.rgba) {
+        updatedCount++;
+        return {
+          ...param,
+          rgba: {
+            R: match.rgba.R ?? param.rgba.R,
+            G: match.rgba.G ?? param.rgba.G,
+            B: match.rgba.B ?? param.rgba.B,
+            A: match.rgba.A ?? param.rgba.A,
+          },
+        };
+      }
+      return param;
+    });
+    recordHistory(newColorParams);
+    debug.addLog(`Updated ${updatedCount} parameters from .rvfxp`);
+    alert(`Imported! ${updatedCount} parameters updated.`);
+  }, [colorParams, recordHistory, debug]);
+
+  const handleApplyRvfxpCurrent = useCallback(() => {
+    if (!pendingRvfxp) return;
+    applyRvfxpToLoadedParams(pendingRvfxp.sessionData);
+    setShowRvfxpImport(false);
+    setPendingRvfxp(null);
+  }, [pendingRvfxp, applyRvfxpToLoadedParams]);
+
+  const handleFreshReimportRvfxp = useCallback(async () => {
+    if (!pendingRvfxp || !pendingRvfxp.detectedHeroId) return;
+    const { detectedHeroId, detectedHeroName, sessionData } = pendingRvfxp;
+    setShowRvfxpImport(false);
+    await handleHeroSelect(detectedHeroId, detectedHeroName || detectedHeroId, false);
+    setTimeout(() => {
+      applyRvfxpToLoadedParams(sessionData);
+      setPendingRvfxp(null);
+    }, 400);
+  }, [pendingRvfxp, handleHeroSelect, applyRvfxpToLoadedParams]);
+
+  // === EXPORT CURRENT SESSION FILE ===
+  const handleExportSession = useCallback(async () => {
+    if (selectedParams.size === 0) { alert('No parameters selected to export.'); return; }
+    const sessionData: SessionEntry[] = colorParams.filter(p => selectedParams.has(p.id)).map(p => ({
+      relativePath: p.relativePath.replace(/\.json$/i, ''),
+      paramName: p.paramName,
+      rgba: p.rgba,
+    }));
     try {
-      await tauri.setFilterDictionary(newDictionary);
-      setSettings(prev => ({ ...prev, filterDictionary: newDictionary }));
-    } catch (err) { console.error('Failed to save filter dictionary:', err); debug.addLog(`Failed to save filter settings: ${err}`); }
-  }, [debug.addLog]);
+      const fileName = sessionName.endsWith('.rvfxp') ? sessionName : `${sessionName}.rvfxp`;
+      const filePath = await tauri.saveDialog({
+        title: 'Export Project File',
+        defaultPath: fileName,
+        filters: [{ name: 'RVFX Project', extensions: ['rvfxp'] }],
+      });
+      if (!filePath) return;
+      await tauri.writeTextFile(filePath as string, JSON.stringify(sessionData, null, 2));
+      alert('Project exported successfully!');
+    } catch (err: any) {
+      alert(`Failed to export session: ${err.message || err}`);
+    }
+  }, [colorParams, selectedParams, sessionName]);
 
-  // === SETTINGS OPEN ===
-  const handleOpenSettings = useCallback(async () => {
-    setShowSettings(true);
-    try {
-      const hbCache = await tauri.getHeroBrowserCacheInfo();
-      setHeroBrowserCacheInfo({ fileCount: hbCache.file_count, totalSizeBytes: hbCache.total_size_bytes });
-      const vfxCache = await tauri.getVfxCacheInfo();
-      setVfxCacheInfo({ fileCount: vfxCache.file_count, totalSizeBytes: vfxCache.total_size_bytes });
-      const manualCache = await tauri.getManualCacheInfo();
-      setManualCacheInfo({ fileCount: manualCache.file_count, totalSizeBytes: manualCache.total_size_bytes });
-    } catch (err) { debug.addLog(`Failed to refresh cache info: ${err}`); }
-  }, [debug.addLog]);
-
-  // === RESET ===
+  // === FULL RESET ===
   const handleReset = useCallback(() => {
-    console.debug('[App] Full reset');
     resetHistory();
     setOriginalFiles({});
     setSelectedParams(new Set());
@@ -916,10 +995,15 @@ export function App() {
     setFolders([]);
     setSelectedFolders(new Set());
     setSessionName('YourProjectName');
-    directoryHandleRef.current = null;
+    setCurrentHeroId(null);
+    setCurrentHeroName(null);
+    setBatchSlots([]);
+    setIsBatchMode(false);
+    setActiveSlotId(null);
     setMasterColor('#ffffff');
     setHueShiftValue(0);
     setShuffleColors(['#ccffff', '#88eeee', '#66dddd']);
+    setIsProceduralShuffle(false);
     setPreserveIntensity(true);
     setIgnoreGrayscale(true);
     setShowGrayscale(true);
@@ -927,204 +1011,28 @@ export function App() {
     setUassetSourceMap({});
   }, [resetHistory]);
 
-  // === HERO VFX SELECT ===
-  const handleHeroSelect = useCallback(async (heroId: string, heroName: string, koMode = false) => {
-    console.debug('[App] handleHeroSelect', heroId, heroName, koMode);
-    setShowHeroBrowser(false);
-    setIsConverting(true);
-    setConversionProgress({ current: 0, total: 1, fileName: koMode ? `Extracting KO Prompt for ${heroName}...` : `Extracting VFX for ${heroName}...` });
-
-    try {
-      if (koMode) {
-        debug.addLog(`Extracting KO Prompt WBP for ${heroName} (${heroId})...`);
-      } else {
-        debug.addLog(`Extracting VFX materials for ${heroName} (${heroId})...`);
-      }
-      const result = await tauri.extractHeroVfx(heroId, koMode);
-      console.debug('[App] Hero extract result:', result);
-
-      if (result.error && result.json_paths.length === 0) {
-        debug.addLog(`Hero extraction warning: ${result.error}`);
-        alert(`No assets found for ${heroName}. ${result.error}`);
-        setIsConverting(false);
-        setConversionProgress({ current: 0, total: 0, fileName: '' });
-        return;
-      }
-
-      debug.addLog(`Got ${result.json_paths.length} JSON files for ${heroName}${result.cached ? ' (cached)' : ''}`);
-
-      // Read all JSON files and feed into processFileObjects
-      const fileObjects: { name: string; content: string; relativePath: string }[] = [];
-      const newSourceMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
-
-      setConversionProgress({ current: 0, total: result.json_paths.length, fileName: 'Loading converted files...' });
-
-      for (let i = 0; i < result.json_paths.length; i++) {
-        const jsonPath = result.json_paths[i];
-        const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
-        const uassetPath = result.uasset_paths[i] || '';
-
-        try {
-          const content = await tauri.readTextFile(jsonPath);
-          // Build a relative path. Skip cache path prefix dynamically:
-          const parts = jsonPath.replace(/\\/g, '/').split('/');
-          const customIdx = parts.findIndex(p => p === 'Custom');
-          const charsIdx = parts.findIndex(p => p === 'Characters');
-          let relativePath = '';
-          if (customIdx >= 0) {
-            relativePath = parts.slice(customIdx + 1).join('/');
-          } else if (charsIdx >= 0) {
-            const heroIdx = parts.indexOf(heroId, charsIdx + 1);
-            relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
-          } else {
-            const heroIdx = parts.lastIndexOf(heroId);
-            relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
-          }
-
-          fileObjects.push({ name: fileName, content, relativePath });
-          newSourceMap[relativePath] = { uassetPath, jsonPath };
-
-          setConversionProgress({ current: i + 1, total: result.json_paths.length, fileName });
-        } catch (readErr) {
-          console.error('[App] Failed to read hero JSON:', jsonPath, readErr);
-          debug.addLog(`Failed to read ${fileName}: ${readErr}`);
-        }
-      }
-
-      if (fileObjects.length > 0) {
-        setConversionProgress({ current: result.json_paths.length, total: result.json_paths.length, fileName: 'Extracting color parameters...' });
-        await new Promise(resolve => setTimeout(resolve, 50));
-
-        // Set the uasset source map for save-back functionality
-        setUassetSourceMap(prev => ({ ...prev, ...newSourceMap }));
-        setSessionName(koMode ? `${heroName.replace(/\s+/g, '_')}_KO` : heroName.replace(/\s+/g, '_'));
-
-        processFileObjects(fileObjects, colorParams.length > 0);
-        debug.addLog(`Loaded ${fileObjects.length} assets for ${heroName}`);
-      } else {
-        debug.addLog(`No readable files found for ${heroName}`);
-      }
-    } catch (err) {
-      console.error('[App] Hero extraction failed:', err);
-      debug.addLog(`Hero extraction failed: ${err}`);
-      alert(`Failed to extract assets for ${heroName}: ${err}`);
-    } finally {
-      setIsConverting(false);
-      setConversionProgress({ current: 0, total: 0, fileName: '' });
-    }
-  }, [debug, processFileObjects, colorParams.length]);
-
-  const handleManualExtract = useCallback(async (assetPaths: string[]) => {
-    console.debug('[App] handleManualExtract', assetPaths.length, 'assets');
-    setShowManualExtraction(false);
-    setIsConverting(true);
-    setConversionProgress({ current: 0, total: assetPaths.length, fileName: `Extracting ${assetPaths.length} assets...` });
-
-    try {
-      debug.addLog(`Extracting ${assetPaths.length} manually queued assets...`);
-      const result = await tauri.extractManualAssets(assetPaths);
-      console.debug('[App] Manual extract result:', result);
-
-      if (result.error) debug.addLog(`Manual extraction warning: ${result.error}`);
-
-      if (result.json_paths.length === 0) {
-        debug.addLog('Manual extraction produced no readable assets');
-        alert(`No assets could be extracted. ${result.error ?? ''}`);
-        return;
-      }
-
-      debug.addLog(`Got ${result.json_paths.length} JSON files from manual extraction`);
-
-      const fileObjects: { name: string; content: string; relativePath: string }[] = [];
-      const newSourceMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
-
-      setConversionProgress({ current: 0, total: result.json_paths.length, fileName: 'Loading converted files...' });
-
-      for (let i = 0; i < result.json_paths.length; i++) {
-        const jsonPath = result.json_paths[i];
-        const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
-        const uassetPath = result.uasset_paths[i] || '';
-
-        try {
-          const content = await tauri.readTextFile(jsonPath);
-          // Assets are extracted as <root>/Content/..., so anchor the display
-          // path on the last Content segment to get the in-game path back.
-          const parts = jsonPath.replace(/\\/g, '/').split('/');
-          const contentIdx = parts.lastIndexOf('Content');
-          const relativePath = contentIdx >= 0 ? parts.slice(contentIdx + 1).join('/') : fileName;
-
-          fileObjects.push({ name: fileName, content, relativePath });
-          newSourceMap[relativePath] = { uassetPath, jsonPath };
-
-          setConversionProgress({ current: i + 1, total: result.json_paths.length, fileName });
-        } catch (readErr) {
-          console.error('[App] Failed to read manual JSON:', jsonPath, readErr);
-          debug.addLog(`Failed to read ${fileName}: ${readErr}`);
-        }
-      }
-
-      if (fileObjects.length > 0) {
-        setConversionProgress({ current: result.json_paths.length, total: result.json_paths.length, fileName: 'Extracting color parameters...' });
-        await new Promise(resolve => setTimeout(resolve, 50));
-
-        // Matches the hero browser: fold into the open session if there is one,
-        // otherwise this extraction starts a fresh one.
-        const shouldAppend = colorParams.length > 0;
-        setUassetSourceMap(prev => (shouldAppend ? { ...prev, ...newSourceMap } : newSourceMap));
-        if (!shouldAppend) setSessionName('ManualExtraction');
-
-        processFileObjects(fileObjects, shouldAppend);
-        debug.addLog(`Loaded ${fileObjects.length} manually extracted assets`);
-      } else {
-        debug.addLog('No readable files found in manual extraction');
-      }
-    } catch (err) {
-      console.error('[App] Manual extraction failed:', err);
-      debug.addLog(`Manual extraction failed: ${err}`);
-      alert(`Failed to extract queued assets: ${err}`);
-    } finally {
-      setIsConverting(false);
-      setConversionProgress({ current: 0, total: 0, fileName: '' });
-    }
-  }, [debug, processFileObjects, colorParams.length]);
-
-  // === DRAG HANDLERS ===
-  const handleDragOver = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(true); }, []);
-  const handleDragLeave = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); }, []);
-  const handleDrop = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); debug.addLog('Drop event detected. Delegating to system listener.'); }, [debug.addLog]);
-
-  // =================== RENDER ===================
   return (
     <div style={{ backgroundColor: 'var(--bg-4)', color: 'var(--text-3)' }} className="h-screen p-6 flex flex-col overflow-hidden">
       <DebugConsole logs={debug.logs} showDebug={debug.showDebug} setShowDebug={debug.setShowDebug} clearLogs={debug.clearLogs} />
-
       <div className="w-full flex-1 flex flex-col min-h-0">
-        <Header 
-          settings={settings} 
-          onOpenSettings={handleOpenSettings} 
-          onOpenFilterSettings={() => setShowFilterSettings(true)} 
-          onReset={handleReset} 
-          addDebugLog={debug.addLog} 
+        <Header
+          settings={settings}
+          onOpenSettings={() => setShowSettings(true)}
+          onOpenFilterSettings={() => setShowFilterSettings(true)}
+          onOpenVfxUpdater={() => setShowVfxUpdater(true)}
+          onReset={handleReset}
+          addDebugLog={debug.addLog}
           onToggleMinimize={() => {
             const newVal = !settings.isHeaderMinimized;
             setSettings(s => ({ ...s, isHeaderMinimized: newVal }));
-            tauri.setHeaderMinimized(newVal).catch(err => console.error('Failed to save header minimized state:', err));
-          }} 
+            tauri.setHeaderMinimized(newVal).catch(console.error);
+          }}
         />
 
-        {/* Usmap Status Banner */}
         {usmapLoading && (
           <div className="mt-2 px-4 py-2 text-sm flex items-center gap-2" style={{ backgroundColor: 'var(--bg-2)', color: 'var(--text-3)' }}>
             <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" strokeDasharray="31.4 31.4" strokeDashoffset="10" /></svg>
             Updating mapping files...
-          </div>
-        )}
-        {usmapStatus && !usmapStatus.installed && !usmapLoading && (
-          <div className="mt-2 px-4 py-2 text-sm flex items-center justify-between" style={{ backgroundColor: 'var(--bg-2)', borderLeft: '3px solid var(--accent-warning, #f59e0b)', color: 'var(--text-3)' }}>
-            <span>⚠ No mapping file found. Auto-download failed — please set a .usmap file manually in Settings.</span>
-            <button onClick={handleOpenSettings} className="px-3 py-1 text-xs font-medium rounded-none" style={{ backgroundColor: 'var(--accent-main)', color: 'var(--bg-4)' }}>
-              Open Settings
-            </button>
           </div>
         )}
 
@@ -1132,131 +1040,233 @@ export function App() {
           {showManualExtraction ? (
             <ManualExtractionPage
               onClose={() => setShowManualExtraction(false)}
-              onExtract={handleManualExtract}
+              onExtract={async (paths) => {
+                setShowManualExtraction(false);
+                setIsConverting(true);
+                const result = await tauri.extractManualAssets(paths);
+                const fileObjs: FileObject[] = [];
+                const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
+                for (let i = 0; i < result.json_paths.length; i++) {
+                  const content = await tauri.readTextFile(result.json_paths[i]);
+                  const name = result.json_paths[i].split(/[\\/]/).pop() || '';
+                  const rel = result.json_paths[i].replace(/\\/g, '/').split('/Content/').pop() || name;
+                  fileObjs.push({ name, content, relativePath: rel });
+                  srcMap[rel] = { uassetPath: result.uasset_paths[i], jsonPath: result.json_paths[i] };
+                }
+                setUassetSourceMap(srcMap);
+                setOriginalFiles({});
+                const freshParams: ColorParam[] = [];
+                const freshFiles: Record<string, any> = {};
+                fileObjs.forEach(f => {
+                  try {
+                    const json = JSON.parse(f.content);
+                    freshFiles[f.relativePath] = json;
+                    parseJsonAndExtractColors(json, f.name, f.relativePath, freshParams, filterDictionary, debug.addLog);
+                  } catch (e) {}
+                });
+                setOriginalFiles(freshFiles);
+                setInitialHistory(freshParams);
+                setSelectedParams(new Set(freshParams.map(p => p.id)));
+                setIsConverting(false);
+              }}
               addDebugLog={debug.addLog}
             />
           ) : colorParams.length > 0 ? (
             <div className="flex flex-col lg:flex-row gap-8 flex-1 min-h-0">
+              {/* Left Global Controls */}
               <div className="lg:flex-shrink-0 global-controls-wrapper w-full flex flex-col min-h-0">
                 <StyledPanel title="Global Controls" className="flex flex-col flex-1 min-h-0" bodyClassName="flex flex-col flex-1 min-h-0 overflow-y-auto p-6 pt-8">
                   <GlobalControls
                     masterColor={masterColor} setMasterColor={setMasterColor}
                     hueShiftValue={hueShiftValue} setHueShiftValue={setHueShiftValue}
-                    useFiveColors={useFiveColors} setUseFiveColors={setUseFiveColors}
+                    useFiveColors={false}
                     shuffleColors={shuffleColors}
                     onShuffleColorChange={(i, c) => { const nc = [...shuffleColors]; nc[i] = c; setShuffleColors(nc); }}
+                    onAddShuffleColor={handleAddShuffleColor}
+                    onRemoveShuffleColor={handleRemoveShuffleColor}
+                    onSetShufflePaletteCount={handleSetShufflePaletteCount}
+                    isProceduralShuffle={isProceduralShuffle}
+                    setIsProceduralShuffle={setIsProceduralShuffle}
+                    proceduralJitter={proceduralJitter}
+                    setProceduralJitter={setProceduralJitter}
                     preserveIntensity={preserveIntensity} setPreserveIntensity={setPreserveIntensity}
                     ignoreGrayscale={ignoreGrayscale} setIgnoreGrayscale={setIgnoreGrayscale}
                     brightnessMultiplier={brightnessMultiplier} setBrightnessMultiplier={setBrightnessMultiplier}
                     opacityValue={opacityValue} setOpacityValue={setOpacityValue}
                     selectedCount={selectedParams.size}
-                    onApplyMasterColor={applyMasterColor} onApplyHueShift={applyHueShift} onApplyShuffle={applyShuffle} onApplyBrightnessMultiplier={applyBrightnessMultiplier} onApplyOpacity={applyOpacity}
+                    onApplyMasterColor={applyMasterColor}
+                    onApplyHueShift={applyHueShift}
+                    onApplyShuffle={applyShuffle}
+                    onApplyBrightnessMultiplier={applyBrightnessMultiplier}
+                    onApplyOpacity={applyOpacity}
+                    isBatchMode={isBatchMode}
+                    batchCount={batchSlots.length}
+                    applyToAllBatch={applyToAllBatch}
+                    setApplyToAllBatch={setApplyToAllBatch}
+                    onOpenTwelveColorModal={() => setShowTwelveColorModal(true)}
                   />
                 </StyledPanel>
               </div>
+
+              {/* Right Parameters Workspace */}
               <div className="flex-grow lg:flex-1 min-w-0 flex flex-col min-h-0">
                 <StyledPanel title="Parameters" className="flex flex-col flex-1 min-h-0" bodyClassName="flex flex-col flex-1 min-h-0 p-6 pt-8 pb-4">
-                  <div className="px-4 pb-4 pt-0 flex flex-col gap-4 border-b flex-shrink-0" style={{ borderColor: 'var(--bg-2)' }}>
-                    <div className="flex justify-between items-start w-full gap-4">
-                      <div className="hidden"></div>
-                      <div className="flex flex-col gap-4 w-full">
-                        {/* Project Settings & Actions Row */}
-                        <div className="flex flex-col sm:flex-row items-center justify-between gap-4 w-full">
-                          {/* Project Filename */}
-                          <div className="flex items-center gap-2 w-full sm:w-auto">
-                            <label htmlFor="sessionNameInput" className="text-sm" style={{ color: 'var(--text-3)' }}>Project Filename:</label>
-                            <input id="sessionNameInput" type="text" value={sessionName} onChange={(e) => setSessionName(e.target.value)} className="w-48 px-3 py-1 rounded-none focus:outline-none focus:ring-2" style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)', color: 'var(--text-2)' }} />
-                            <span className="text-sm" style={{ color: 'var(--text-4)' }}>.rvfxp</span>
-                            <button onClick={handleImportSession} title="Import Project" className="flex items-center justify-center w-8 h-8 rounded-none transition-colors shadow-md ml-2" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }}>
-                              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+                  {/* ISOLATED SLOTS TAB BAR */}
+                  {isBatchMode && batchSlots.length > 0 && (
+                    <div className="px-4 py-2 border-b flex items-center justify-between gap-3 overflow-x-auto" style={{ borderColor: 'var(--bg-2)', backgroundColor: 'var(--bg-2)' }}>
+                      <div className="flex items-center gap-2 overflow-x-auto">
+                        <span className="text-[11px] font-bold uppercase tracking-wider text-[var(--accent-main)] flex-shrink-0">
+                          SLOTS:
+                        </span>
+                        {batchSlots.map((slot, idx) => {
+                          const isActive = activeSlotId === slot.slotId;
+                          return (
+                            <button
+                              key={slot.slotId}
+                              onClick={() => handleSwitchSlot(slot.slotId)}
+                              className="px-3 py-1 text-xs border font-mono truncate transition-all duration-150"
+                              style={{
+                                backgroundColor: isActive ? 'var(--accent-main)' : 'var(--bg-3)',
+                                color: isActive ? 'var(--bg-4)' : 'var(--text-2)',
+                                borderColor: isActive ? 'var(--accent-main)' : 'var(--bg-1)',
+                                fontWeight: isActive ? 'bold' : 'normal',
+                              }}
+                            >
+                              #{idx + 1} {slot.customLabel}
                             </button>
-                            <button onClick={handleExportSession} title="Export Selected to Project" className="flex items-center justify-center w-8 h-8 rounded-none transition-colors shadow-md" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }}>
-                              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></svg>
-                            </button>
-                          </div>
+                          );
+                        })}
+                      </div>
 
-                          {/* Undo, Redo, Save Actions */}
-                          <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
-                            {saveStatus && (
-                              <span className="text-xs whitespace-nowrap mr-2" style={{ color: 'var(--text-4)' }}>{saveStatus}</span>
-                            )}
-                            <button onClick={handleResetSelected} title="Reset Selected to Original" className="flex items-center justify-center px-3 py-2 font-medium rounded-none transition-colors shadow-md disabled:opacity-50 disabled:cursor-not-allowed" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }} disabled={selectedParams.size === 0 || colorParams.length === 0}>
-                              <svg className="mr-1.5" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-                              <span className="text-sm">Reset</span>
-                            </button>
-                            <button onClick={handleUndo} title="Undo (Ctrl+Z)" className="flex items-center justify-center p-2 font-medium rounded-none transition-colors shadow-md disabled:opacity-50 disabled:cursor-not-allowed" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }} disabled={historyIndex === 0}>
-                              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg>
-                            </button>
-                            <button onClick={handleRedo} title="Redo (Ctrl+Y)" className="flex items-center justify-center p-2 font-medium rounded-none transition-colors shadow-md disabled:opacity-50 disabled:cursor-not-allowed" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }} disabled={historyIndex >= historyLength - 1}>
-                              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>
-                            </button>
-                            {Object.keys(uassetSourceMap).length > 0 ? (
-                              <button onClick={(e) => handleSaveAsUasset(e.shiftKey)} disabled={isConverting} title="Save edited files (Shift+click to save ALL)" className="flex items-center gap-2 px-6 py-2 font-medium rounded-none transition-colors shadow-md disabled:opacity-50 whitespace-nowrap w-auto" style={{ backgroundColor: 'var(--accent-green)', color: 'var(--text-1)' }}>
-                                <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 21v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4M7 21h10M5 21H3V5a2 2 0 012-2h14a2 2 0 012 2v14a2 2 0 01-2 2h-2M12 11v-4M9 11h6"></path></svg>
-                                Save UAsset
-                              </button>
-                            ) : (
-                              <button onClick={handleSave} className="flex items-center gap-2 px-6 py-2 font-medium rounded-none transition-colors shadow-md whitespace-nowrap w-auto" style={{ backgroundColor: 'var(--accent-green)', color: 'var(--text-1)' }}>
-                                <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 21v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4M7 21h10M5 21H3V5a2 2 0 012-2h14a2 2 0 012 2v14a2 2 0 01-2 2h-2M12 11v-4M9 11h6"></path></svg>
-                                Save JSON
-                              </button>
-                            )}
-                          </div>
+                      {/* BATCH SAVE ALL SLOTS BUTTON */}
+                      <button
+                        onClick={handleBatchSaveAll}
+                        disabled={isConverting}
+                        className="px-3 py-1 text-xs font-bold uppercase tracking-wider flex-shrink-0 transition-all border"
+                        style={{
+                          backgroundColor: '#0284c7',
+                          color: 'white',
+                          borderColor: '#38bdf8',
+                        }}
+                        title="Save each slot into its own separate mod folder automatically"
+                      >
+                        ⚡ Save All ({batchSlots.length}) Slots
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="px-4 pb-4 pt-0 flex flex-col gap-4 border-b flex-shrink-0" style={{ borderColor: 'var(--bg-2)' }}>
+                    <div className="flex flex-col gap-4 w-full">
+                      {/* Project Filename & Save Controls */}
+                      <div className="flex flex-col sm:flex-row items-center justify-between gap-4 w-full">
+                        <div className="flex items-center gap-2 w-full sm:w-auto">
+                          <label htmlFor="sessionNameInput" className="text-sm" style={{ color: 'var(--text-3)' }}>Project Filename:</label>
+                          <input
+                            id="sessionNameInput"
+                            type="text"
+                            value={sessionName}
+                            onChange={(e) => setSessionName(e.target.value)}
+                            className="w-48 px-3 py-1 rounded-none focus:outline-none focus:ring-2"
+                            style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)', color: 'var(--text-2)' }}
+                          />
+                          <span className="text-sm" style={{ color: 'var(--text-4)' }}>.rvfxp</span>
+                          <button onClick={handleImportSession} title="Import Project (.rvfxp)" className="flex items-center justify-center w-8 h-8 rounded-none transition-colors shadow-md ml-2" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }}>
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+                          </button>
+                          <button onClick={handleExportSession} title="Export Selected to Project (.rvfxp)" className="flex items-center justify-center w-8 h-8 rounded-none transition-colors shadow-md" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }}>
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></svg>
+                          </button>
                         </div>
-                        {/* Filter Row */}
-                        <div className="flex flex-col gap-2 w-full">
-                          <div className="flex items-center gap-4">
-                            <input type="text" placeholder="Filter by name..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="flex-1 px-3 py-2 rounded-none focus:outline-none focus:ring-2" style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)', color: 'var(--text-2)' }} />
-                            <label className="flex items-center text-sm cursor-pointer whitespace-nowrap" style={{ color: 'var(--text-3)' }}>
-                              <input type="checkbox" checked={showColor} onChange={() => setShowColor(!showColor)} className="w-4 h-4 rounded-none focus:ring-offset-0 focus:ring-0 mr-2" style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)', color: 'var(--accent-main)' }} />
-                              Show Color
-                            </label>
-                            <label className="flex items-center text-sm cursor-pointer whitespace-nowrap" style={{ color: 'var(--text-3)' }}>
-                              <input type="checkbox" checked={showGrayscale} onChange={() => setShowGrayscale(!showGrayscale)} className="w-4 h-4 rounded-none focus:ring-offset-0 focus:ring-0 mr-2" style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)', color: 'var(--accent-main)' }} />
-                              Show Grayscale
-                            </label>
-                            <label className="flex items-center text-sm cursor-pointer whitespace-nowrap" style={{ color: 'var(--text-3)' }}>
-                              <input type="checkbox" checked={showEnemy} onChange={() => setShowEnemy(!showEnemy)} className="w-4 h-4 rounded-none focus:ring-offset-0 focus:ring-0 mr-2" style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)', color: 'var(--accent-main)' }} />
-                              Show Enemy
-                            </label>
-                          </div>
-                          {baseFilteredParams.length > 0 && (
-                            <div className="flex flex-row gap-6 w-full">
-                              <div className="flex-1 min-w-0">
-                                <ColorRangeFilter colorParams={baseFilteredParams} hueRange={hueRange} onHueRangeChange={setHueRange} />
-                              </div>
-                              <div className="flex-1 min-w-0">
-                                <LumaRangeFilter colorParams={baseFilteredParams} lumaRange={lumaRange} onLumaRangeChange={setLumaRange} />
-                              </div>
-                            </div>
-                          )}
-                          {folders.length > 1 && (
-                            <div>
-                              <h4 className="text-xs font-medium mb-1" style={{ color: 'var(--text-3)' }}>Filter by Folder:</h4>
-                              <div className="flex flex-wrap gap-x-4 gap-y-2">
-                                {folders.map(folder => (
-                                  <label key={folder} className="flex items-center text-xs cursor-pointer" style={{ color: 'var(--text-3)' }} title="Alt + Click to solo select">
-                                    <input
-                                      type="checkbox"
-                                      checked={selectedFolders.has(folder)}
-                                      onClick={(e) => { if (e.altKey) { e.preventDefault(); handleFolderToggle(folder, true); } }}
-                                      onChange={(e) => { if (!(e.nativeEvent as MouseEvent).altKey) handleFolderToggle(folder); }}
-                                      className="w-3 h-3 rounded-none focus:ring-offset-0 focus:ring-0 mr-1"
-                                      style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)', color: 'var(--accent-main)' }}
-                                    />
-                                    {folder === '/' ? 'Root' : folder}
-                                  </label>
-                                ))}
-                              </div>
-                            </div>
-                          )}
+
+                        <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+                          {saveStatus && <span className="text-xs whitespace-nowrap mr-2" style={{ color: 'var(--text-4)' }}>{saveStatus}</span>}
+                          <button onClick={handleResetSelected} title="Reset Selected to Original" className="px-3 py-2 font-medium rounded-none transition-colors shadow-md disabled:opacity-50" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }} disabled={selectedParams.size === 0}>
+                            <span className="text-sm">Reset</span>
+                          </button>
+                          <button onClick={handleUndo} title="Undo (Ctrl+Z)" className="p-2 font-medium rounded-none transition-colors shadow-md disabled:opacity-50" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }} disabled={historyIndex === 0}>
+                            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" /></svg>
+                          </button>
+                          <button onClick={handleRedo} title="Redo (Ctrl+Y)" className="p-2 font-medium rounded-none transition-colors shadow-md disabled:opacity-50" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }} disabled={historyIndex >= historyLength - 1}>
+                            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" /></svg>
+                          </button>
+
+                          <button
+                            onClick={(e) => handleSaveAsUasset(e.shiftKey)}
+                            disabled={isConverting}
+                            title="Save current hero mod folder"
+                            className="flex items-center gap-2 px-6 py-2 font-medium rounded-none transition-colors shadow-md disabled:opacity-50 whitespace-nowrap"
+                            style={{ backgroundColor: 'var(--accent-green)', color: 'var(--text-1)' }}
+                          >
+                            <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 21v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4M7 21h10M5 21H3V5a2 2 0 012-2h14a2 2 0 012 2v14a2 2 0 01-2 2h-2M12 11v-4M9 11h6" /></svg>
+                            Save UAsset
+                          </button>
                         </div>
                       </div>
+
+                      {/* Parameter Filters */}
+                      <div className="flex items-center gap-4">
+                        <input
+                          type="text"
+                          placeholder="Filter by name..."
+                          value={searchTerm}
+                          onChange={(e) => setSearchTerm(e.target.value)}
+                          className="flex-1 px-3 py-2 rounded-none focus:outline-none focus:ring-2"
+                          style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)', color: 'var(--text-2)' }}
+                        />
+                        <label className="flex items-center text-sm cursor-pointer whitespace-nowrap" style={{ color: 'var(--text-3)' }}>
+                          <input type="checkbox" checked={showColor} onChange={() => setShowColor(!showColor)} className="w-4 h-4 mr-2" />
+                          Show Color
+                        </label>
+                        <label className="flex items-center text-sm cursor-pointer whitespace-nowrap" style={{ color: 'var(--text-3)' }}>
+                          <input type="checkbox" checked={showGrayscale} onChange={() => setShowGrayscale(!showGrayscale)} className="w-4 h-4 mr-2" />
+                          Show Grayscale
+                        </label>
+                        <label className="flex items-center text-sm cursor-pointer whitespace-nowrap" style={{ color: 'var(--text-3)' }}>
+                          <input type="checkbox" checked={showEnemy} onChange={() => setShowEnemy(!showEnemy)} className="w-4 h-4 mr-2" />
+                          Show Enemy
+                        </label>
+                      </div>
+
+                      {/* Dual Range Sliders */}
+                      {baseFilteredParams.length > 0 && (
+                        <div className="flex flex-row gap-6 w-full">
+                          <div className="flex-1 min-w-0">
+                            <ColorRangeFilter colorParams={baseFilteredParams} hueRange={hueRange} onHueRangeChange={setHueRange} />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <LumaRangeFilter colorParams={baseFilteredParams} lumaRange={lumaRange} onLumaRangeChange={setLumaRange} />
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Folders List (Isolated for current active hero only) */}
+                      {folders.length > 1 && (
+                        <div>
+                          <h4 className="text-xs font-medium mb-1" style={{ color: 'var(--text-3)' }}>Filter by Folder:</h4>
+                          <div className="flex flex-wrap gap-x-4 gap-y-2">
+                            {folders.map(folder => (
+                              <label key={folder} className="flex items-center text-xs cursor-pointer" style={{ color: 'var(--text-3)' }}>
+                                <input
+                                  type="checkbox"
+                                  checked={selectedFolders.has(folder)}
+                                  onClick={(e) => { if (e.altKey) { e.preventDefault(); handleFolderToggle(folder, true); } }}
+                                  onChange={(e) => { if (!(e.nativeEvent as MouseEvent).altKey) handleFolderToggle(folder); }}
+                                  className="w-3 h-3 mr-1"
+                                />
+                                {folder === '/' ? 'Root' : folder}
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
+
                     <p className="text-sm" style={{ color: 'var(--text-4)' }}>
-                      {filteredParams.length} color parameters found across {filteredAssetCount} assets. <span style={{ color: 'var(--accent-main)' }}>{selectedParams.size} selected.</span>
+                      {filteredParams.length} color parameters found across {filteredAssetCount} assets for{' '}
+                      <strong className="text-white">{currentHeroName || sessionName}</strong>. <span style={{ color: 'var(--accent-main)' }}>{selectedParams.size} selected.</span>
                     </p>
                   </div>
+
                   <ParameterTable
                     filteredParams={filteredParams} selectedParams={selectedParams}
                     hueShiftValue={hueShiftValue} ignoreGrayscale={ignoreGrayscale} preserveIntensity={preserveIntensity}
@@ -1267,16 +1277,122 @@ export function App() {
               </div>
             </div>
           ) : (
-            <LoadFilesPanel settings={settings} isDragging={isDragging} onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop} onSelectFolder={handleSelectUassetFolder} onBrowseHeroes={() => { console.debug('[App] Opening hero browser'); setShowHeroBrowser(true); }} onManualExtraction={() => { console.debug('[App] Opening manual extraction'); setShowManualExtraction(true); }} />
+            <LoadFilesPanel
+              settings={settings}
+              isDragging={isDragging}
+              onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+              onDragLeave={(e) => { e.preventDefault(); setIsDragging(false); }}
+              onDrop={(e) => { e.preventDefault(); setIsDragging(false); }}
+              onSelectFolder={async () => {
+                const selectedPath = await tauri.openDialog({ directory: true, multiple: false }) as string;
+                if (!selectedPath) return;
+                setIsConverting(true);
+                const result = await tauri.batchConvertDirectory(selectedPath);
+                const fileObjs: FileObject[] = [];
+                const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
+                for (let i = 0; i < result.json_paths.length; i++) {
+                  const content = await tauri.readTextFile(result.json_paths[i]);
+                  const name = result.json_paths[i].split(/[\\/]/).pop() || '';
+                  fileObjs.push({ name, content, relativePath: name });
+                  srcMap[name] = { uassetPath: result.uasset_paths[i], jsonPath: result.json_paths[i] };
+                }
+                setUassetSourceMap(srcMap);
+                const freshParams: ColorParam[] = [];
+                const freshFiles: Record<string, any> = {};
+                fileObjs.forEach(f => {
+                  try {
+                    const json = JSON.parse(f.content);
+                    freshFiles[f.relativePath] = json;
+                    parseJsonAndExtractColors(json, f.name, f.relativePath, freshParams, filterDictionary, debug.addLog);
+                  } catch (e) {}
+                });
+                setOriginalFiles(freshFiles);
+                setInitialHistory(freshParams);
+                setSelectedParams(new Set(freshParams.map(p => p.id)));
+                setIsConverting(false);
+              }}
+              onBrowseHeroes={() => setShowHeroBrowser(true)}
+              onManualExtraction={() => setShowManualExtraction(true)}
+            />
           )}
         </div>
       </div>
 
       {/* MODALS */}
-      {showSettings && <SettingsModal settings={settings} setSettings={setSettings} heroBrowserCacheInfo={heroBrowserCacheInfo} vfxCacheInfo={vfxCacheInfo} manualCacheInfo={manualCacheInfo} onClose={() => setShowSettings(false)} onClearHeroBrowserCache={async () => { await tauri.clearHeroBrowserCache(); setHeroBrowserCacheInfo({ fileCount: 0, totalSizeBytes: 0 }); }} onClearVfxCache={async () => { await tauri.clearVfxCache(); setVfxCacheInfo({ fileCount: 0, totalSizeBytes: 0 }); }} onClearManualCache={async () => { await tauri.clearManualCache(); setManualCacheInfo({ fileCount: 0, totalSizeBytes: 0 }); }} />}
-      {showFilterSettings && <FilterSettingsModal filterDictionary={filterDictionary} onChangeDictionary={handleFilterDictionaryChange} onClose={() => setShowFilterSettings(false)} onReset={() => handleFilterDictionaryChange(DEFAULT_FILTER_DICTIONARY)} />}
+      {showSettings && (
+        <SettingsModal
+          settings={settings}
+          setSettings={setSettings}
+          heroBrowserCacheInfo={heroBrowserCacheInfo}
+          vfxCacheInfo={vfxCacheInfo}
+          manualCacheInfo={manualCacheInfo}
+          onClose={() => setShowSettings(false)}
+          onClearHeroBrowserCache={async () => { await tauri.clearHeroBrowserCache(); setHeroBrowserCacheInfo({ fileCount: 0, totalSizeBytes: 0 }); }}
+          onClearVfxCache={async () => { await tauri.clearVfxCache(); setVfxCacheInfo({ fileCount: 0, totalSizeBytes: 0 }); }}
+          onClearManualCache={async () => { await tauri.clearManualCache(); setManualCacheInfo({ fileCount: 0, totalSizeBytes: 0 }); }}
+        />
+      )}
+
+      {showFilterSettings && (
+        <FilterSettingsModal
+          filterDictionary={filterDictionary}
+          onChangeDictionary={async (dict) => {
+            setFilterDictionary(dict);
+            await tauri.setFilterDictionary(dict);
+          }}
+          onClose={() => setShowFilterSettings(false)}
+          onReset={() => setFilterDictionary(DEFAULT_FILTER_DICTIONARY)}
+        />
+      )}
+
+      {showHeroBrowser && (
+        <HeroBrowserModal
+          onClose={() => setShowHeroBrowser(false)}
+          onSelectHero={handleHeroSelect}
+          onBatchLoadHeroes={handleBatchLoadHeroes}
+          addDebugLog={debug.addLog}
+        />
+      )}
+
+      {showTwelveColorModal && currentHeroId && (
+        <AutoTwelveColorModal
+          heroId={currentHeroId}
+          heroName={currentHeroName || currentHeroId}
+          colorParams={colorParams}
+          originalFiles={originalFiles}
+          uassetSourceMap={uassetSourceMap}
+          preserveIntensity={preserveIntensity}
+          ignoreGrayscale={ignoreGrayscale}
+          onClose={() => setShowTwelveColorModal(false)}
+          addDebugLog={debug.addLog}
+        />
+      )}
+
+      {showRvfxpImport && pendingRvfxp && (
+        <RvfxpImportModal
+          filePath={pendingRvfxp.filePath}
+          sessionData={pendingRvfxp.sessionData}
+          detectedHeroId={pendingRvfxp.detectedHeroId}
+          detectedHeroName={pendingRvfxp.detectedHeroName}
+          currentLoadedHeroId={currentHeroId}
+          onApplyCurrent={handleApplyRvfxpCurrent}
+          onFreshReimport={handleFreshReimportRvfxp}
+          onClose={() => {
+            setShowRvfxpImport(false);
+            setPendingRvfxp(null);
+          }}
+        />
+      )}
+
+      {showVfxUpdater && (
+        <VfxUpdaterModal
+          initialUsmapPath={settings.usmapPath}
+          onClose={() => setShowVfxUpdater(false)}
+          addDebugLog={debug.addLog}
+        />
+      )}
+
       {isConverting && <ConversionProgressOverlay conversionProgress={conversionProgress} />}
-      {showHeroBrowser && <HeroBrowserModal onClose={() => setShowHeroBrowser(false)} onSelectHero={handleHeroSelect} addDebugLog={debug.addLog} />}
     </div>
   );
 }

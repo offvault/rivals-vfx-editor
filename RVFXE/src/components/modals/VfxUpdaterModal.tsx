@@ -3,17 +3,19 @@ import * as tauri from '@/services/tauri';
 
 export interface VfxUpdaterModalProps {
   initialUsmapPath: string | null;
+  initialModPath?: string | null;
   onClose: () => void;
   addDebugLog: (msg: string) => void;
 }
 
 export function VfxUpdaterModal({
   initialUsmapPath,
+  initialModPath,
   onClose,
   addDebugLog,
 }: VfxUpdaterModalProps) {
   const [usmapPath, setUsmapPath] = useState<string>(initialUsmapPath || '');
-  const [modPath, setModPath] = useState<string>('');
+  const [modPath, setModPath] = useState<string>(initialModPath || '');
   const [outputDir, setOutputDir] = useState<string>('');
   const [isUpdating, setIsUpdating] = useState(false);
   const [isFetchingUsmap, setIsFetchingUsmap] = useState(false);

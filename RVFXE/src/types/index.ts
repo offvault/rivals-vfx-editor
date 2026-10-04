@@ -113,6 +113,7 @@ export interface BatchHeroSlot {
   heroId: string;
   heroName: string;
   customLabel: string;
+  bundleGroup?: string;
 }
 
 export interface HeroRosterResult {
@@ -143,6 +144,56 @@ export interface SessionEntry {
   relativePath: string;
   paramName: string;
   rgba: RGBA;
+}
+
+// ===== Recipe-Based .rvfxp Preset (Version 2) =====
+export interface RvfxpRecipe {
+  mode: 'single' | 'shuffle' | 'procedural' | '12color';
+  masterColor: string;
+  enemyColor?: string;
+  shufflePalette: string[];
+  preserveIntensity: boolean;
+  ignoreGrayscale: boolean;
+  proceduralJitter: number;
+  brightnessMultiplier: number;
+  opacityValue: number;
+  hueShift: number;
+}
+
+export interface RvfxpSlot {
+  slotId: string;
+  heroId: string;
+  heroName: string;
+  customLabel: string;
+  targetSubpaths?: string[];
+}
+
+export interface RvfxpPresetV2 {
+  version: 2;
+  generator: 'RivalsVFXEditor';
+  timestamp: string;
+  recipe: RvfxpRecipe;
+  slots: RvfxpSlot[];
+  savedParameters: SessionEntry[];
+}
+
+// ===== 1-Click Direct Mod Packaging Options =====
+export interface PackagingOptions {
+  targetFormat: 'iostore' | 'raw_uassets';
+  compress: boolean;
+  createZip: boolean;
+  bundleName?: string;
+}
+
+export interface ModPackageResult {
+  success: boolean;
+  modName: string;
+  utocPath?: string;
+  ucasPath?: string;
+  pakPath?: string;
+  zipPath?: string;
+  rawDir?: string;
+  message?: string;
 }
 
 // ===== Usmap Management =====

@@ -25,6 +25,7 @@ export function HeroBrowserModal({ onClose, onSelectHero, onBatchLoadHeroes, add
   const [koMode, setKoMode] = useState(false);
   const [isBatchMode, setIsBatchMode] = useState(false);
   const [batchQueue, setBatchQueue] = useState<BatchHeroSlot[]>([]);
+  const [bundleGroupName, setBundleGroupName] = useState('');
 
   // Load hero roster on mount
   useEffect(() => {
@@ -151,6 +152,7 @@ export function HeroBrowserModal({ onClose, onSelectHero, onBatchLoadHeroes, add
         heroId: hero.hero_id,
         heroName: hero.display_name,
         customLabel: label,
+        bundleGroup: bundleGroupName || undefined,
       },
     ]);
   };
@@ -162,7 +164,11 @@ export function HeroBrowserModal({ onClose, onSelectHero, onBatchLoadHeroes, add
   const handleBatchLoad = () => {
     if (batchQueue.length === 0) return;
     if (onBatchLoadHeroes) {
-      onBatchLoadHeroes(batchQueue, koMode);
+      const slotsWithBundle = batchQueue.map(s => ({
+        ...s,
+        bundleGroup: s.bundleGroup || bundleGroupName || undefined,
+      }));
+      onBatchLoadHeroes(slotsWithBundle, koMode);
       onClose();
     }
   };
@@ -352,6 +358,28 @@ export function HeroBrowserModal({ onClose, onSelectHero, onBatchLoadHeroes, add
                       </button>
                     </div>
                   ))}
+                </div>
+              )}
+
+              {batchQueue.length > 0 && (
+                <div className="flex items-center gap-2 pt-2 border-t border-gray-700/50 text-xs">
+                  <span className="font-semibold text-[11px] text-[var(--accent-main)] whitespace-nowrap">
+                    Bundle / Group Mods:
+                  </span>
+                  <input
+                    type="text"
+                    placeholder="e.g. FantasticDuo_PinkVFX (optional combined zip bundle)"
+                    value={bundleGroupName}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setBundleGroupName(val);
+                      setBatchQueue(prev => prev.map(s => ({ ...s, bundleGroup: val })));
+                    }}
+                    className="bg-transparent border-b border-gray-600 focus:border-[var(--accent-main)] outline-none text-xs px-2 py-0.5 flex-1"
+                    style={{ color: 'var(--text-1)' }}
+                    title="All slots with this bundle group name will be bundled into a single .zip"
+                  />
+                  <span className="text-[10px] opacity-60">Zips all bundled mods together</span>
                 </div>
               )}
             </div>

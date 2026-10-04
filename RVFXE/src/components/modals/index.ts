@@ -6,3 +6,4 @@ export { HeroBrowserModal } from './HeroBrowserModal';
 export { AutoTwelveColorModal } from './AutoTwelveColorModal';
 export { RvfxpImportModal } from './RvfxpImportModal';
 export { VfxUpdaterModal } from './VfxUpdaterModal';
+export { SaveModModal } from './SaveModModal';

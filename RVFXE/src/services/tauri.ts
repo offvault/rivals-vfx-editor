@@ -220,3 +220,21 @@ export async function updateVfxMod(modPath: string, usmapPath: string | null, ou
   console.debug('[tauri] Updating mod:', modPath, 'with usmap:', usmapPath, 'output:', outputDir);
   return invoke('update_vfx_mod', { modPath, usmapPath, outputDir });
 }
+
+export async function packageIostoreMod(options: {
+  mod_name: string;
+  output_dir: string;
+  json_paths: string[];
+  target_format: string;
+  compress: boolean;
+  create_zip: boolean;
+  bundle_name?: string | null;
+}): Promise<import('@/types').ModPackageResult> {
+  console.debug('[tauri] Packaging IoStore mod:', options.mod_name, 'format:', options.target_format);
+  return invoke('package_iostore_mod', { options });
+}
+
+export async function createBundleZip(bundleName: string, outputDir: string, filePaths: string[]): Promise<string> {
+  console.debug('[tauri] Creating bundle zip:', bundleName, 'files:', filePaths.length);
+  return invoke('create_bundle_zip', { bundleName, outputDir, filePaths });
+}

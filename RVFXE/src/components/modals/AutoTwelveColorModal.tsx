@@ -1,8 +1,8 @@
 import { useState } from 'react';
-import type { ColorParam, RGBA, UassetSourceMap } from '@/types';
+import type { ColorParam, RGBA, UassetSourceMap, RvfxpPresetV2 } from '@/types';
 import * as tauri from '@/services/tauri';
 import { hexToRgba, applyColorToParam, isEnemyParameter } from '@/utils/color';
-import { setNestedValue } from '@/utils/helpers';
+import { setNestedValue, getPakReadyRelativePath } from '@/utils/helpers';
 
 export interface AutoTwelveColorModalProps {
   heroId: string;
@@ -51,6 +51,10 @@ export function AutoTwelveColorModal({
 }: AutoTwelveColorModalProps) {
   const [themes, setThemes] = useState<ColorTheme[]>(DEFAULT_THEMES);
   const [outputDir, setOutputDir] = useState<string>('');
+  const [targetFormat, setTargetFormat] = useState<'iostore' | 'raw_uassets'>('iostore');
+  const [compressOodle, setCompressOodle] = useState(true);
+  const [createZip, setCreateZip] = useState(true);
+  const [bundleAll12, setBundleAll12] = useState(true);
   const [exportRvfxp, setExportRvfxp] = useState(true);
   const [pakReady, setPakReady] = useState(true);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -91,6 +95,7 @@ export function AutoTwelveColorModal({
 
     try {
       const totalThemes = themes.length;
+      const allContainerFiles: string[] = [];
 
       for (let t = 0; t < totalThemes; t++) {
         const theme = themes[t];
@@ -147,41 +152,84 @@ export function AutoTwelveColorModal({
             const jsonContent = JSON.stringify(themeModifiedFiles[keyPath], null, 2);
             await tauri.writeTextFile(sourceInfo.jsonPath, jsonContent);
 
-            let outRelPath = keyPath.replace(/\.json$/i, '.uasset');
-            if (pakReady) {
-              const heroPart = outRelPath.replace(/^.*Characters\//i, '').replace(/^.*Custom\//i, '');
-              outRelPath = `${modFolderName}/Marvel/Content/Marvel/VFX/Materials/Characters/${heroPart}`;
-            } else {
-              outRelPath = `${modFolderName}/${outRelPath}`;
-            }
+            // Universal dynamic pak-ready path resolution
+            const outRelPath = pakReady
+              ? getPakReadyRelativePath(keyPath, modFolderName)
+              : `${modFolderName}/${keyPath.replace(/\.json$/i, '.uasset')}`;
 
             jsonPathsForConversion.push(`${sourceInfo.jsonPath},${outRelPath}`);
           }
         }
 
-        // Convert JSON to UAsset
-        if (jsonPathsForConversion.length > 0) {
-          await tauri.batchConvertJsonsToUassets(jsonPathsForConversion, outputDir);
-        }
-
-        // Optional .rvfxp file export
+        // Optional Version 2 .rvfxp preset export
         if (exportRvfxp) {
-          const rvfxpName = `${cleanHeroName}_${theme.key}.rvfxp`;
+          const rvfxpPreset: RvfxpPresetV2 = {
+            version: 2,
+            generator: 'RivalsVFXEditor',
+            timestamp: new Date().toISOString(),
+            recipe: {
+              mode: '12color',
+              masterColor: theme.hex,
+              enemyColor: theme.enemyHex,
+              shufflePalette: [theme.hex, theme.enemyHex],
+              preserveIntensity,
+              ignoreGrayscale,
+              proceduralJitter: 0.35,
+              brightnessMultiplier: 1.0,
+              opacityValue: 1.0,
+              hueShift: 0,
+            },
+            slots: [
+              {
+                slotId: `slot_${heroId}_${theme.key}`,
+                heroId,
+                heroName,
+                customLabel: modFolderName,
+                targetSubpaths: [`Characters/${heroId}`],
+              },
+            ],
+            savedParameters: themeSessionData,
+          };
           const modRootPath = `${outputDir}/${modFolderName}`;
           await tauri.writeTextFile(
-            `${modRootPath}/${rvfxpName}`,
-            JSON.stringify(themeSessionData, null, 2)
+            `${modRootPath}.rvfxp`,
+            JSON.stringify(rvfxpPreset, null, 2)
           );
         }
 
+        // Package into Game-Ready IoStore or Raw UAssets
+        if (jsonPathsForConversion.length > 0) {
+          const packageRes = await tauri.packageIostoreMod({
+            mod_name: modFolderName,
+            output_dir: outputDir,
+            json_paths: jsonPathsForConversion,
+            target_format: targetFormat,
+            compress: compressOodle,
+            create_zip: !bundleAll12 && createZip,
+            bundle_name: bundleAll12 ? `${cleanHeroName}_12Colors_ModPack` : null,
+          });
+
+          if (packageRes.utocPath) allContainerFiles.push(packageRes.utocPath);
+          if (packageRes.ucasPath) allContainerFiles.push(packageRes.ucasPath);
+          if (packageRes.pakPath) allContainerFiles.push(packageRes.pakPath);
+        }
+
         addDebugLog(`✓ Generated ${theme.name} -> ${modFolderName}`);
+      }
+
+      // If bundleAll12 is requested, create the single unified bundle .zip
+      if (targetFormat === 'iostore' && createZip && bundleAll12 && allContainerFiles.length > 0) {
+        setCurrentStep('Creating unified 12-Color Pack bundle zip archive...');
+        const bundleArchiveName = `${cleanHeroName}_12Colors_ModPack`;
+        await tauri.createBundleZip(bundleArchiveName, outputDir, allContainerFiles);
+        addDebugLog(`✓ Created unified bundle: ${bundleArchiveName}.zip (${allContainerFiles.length} container files)`);
       }
 
       setProgressPercent(100);
       setCurrentStep('Complete! All 12 color variants generated.');
       addDebugLog(`Finished 12-Color Pack generation for ${heroName}.`);
       await tauri.openFolder(outputDir);
-      alert(`Success! All 12 mod folders generated in:\n${outputDir}`);
+      alert(`Success! All 12 mod variants packaged into:\n${outputDir}`);
       onClose();
     } catch (err) {
       console.error('Failed generating 12-color pack:', err);
@@ -243,30 +291,102 @@ export function AutoTwelveColorModal({
               </button>
             </div>
             <p className="text-[11px] mt-1" style={{ color: 'var(--text-4)' }}>
-              Creates 12 separate folders (e.g. <code>Done/{cleanHeroName}_RedVFX/Marvel/Content/...</code>) ready for 1-click packing with Repak.
+              Creates game-ready mod packages or asset hierarchies for all 12 color variants with enemy color inversion.
             </p>
           </div>
 
-          {/* Options */}
-          <div className="grid grid-cols-2 gap-3 text-xs" style={{ color: 'var(--text-2)' }}>
-            <label className="flex items-center gap-2 p-2 border cursor-pointer" style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)' }}>
-              <input
-                type="checkbox"
-                checked={pakReady}
-                onChange={e => setPakReady(e.target.checked)}
-                className="w-4 h-4"
-              />
-              <span>Pak-Ready Directory Structure (<code>Marvel/Content/...</code>)</span>
-            </label>
-            <label className="flex items-center gap-2 p-2 border cursor-pointer" style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)' }}>
-              <input
-                type="checkbox"
-                checked={exportRvfxp}
-                onChange={e => setExportRvfxp(e.target.checked)}
-                className="w-4 h-4"
-              />
-              <span>Generate matching <code>.rvfxp</code> profile in each folder</span>
-            </label>
+          {/* Packaging Target & Options */}
+          <div className="space-y-2 p-3 border text-xs" style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)' }}>
+            <div className="flex items-center justify-between font-bold text-xs" style={{ color: 'var(--accent-main)' }}>
+              <span>PACKAGING TARGET & OUTPUT FORMAT</span>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+              <label className="flex items-center gap-2 p-2 border cursor-pointer" style={{ backgroundColor: 'var(--bg-3)', borderColor: targetFormat === 'iostore' ? 'var(--accent-main)' : 'var(--bg-1)' }}>
+                <input
+                  type="radio"
+                  name="twelveColorTarget"
+                  checked={targetFormat === 'iostore'}
+                  onChange={() => setTargetFormat('iostore')}
+                  className="w-4 h-4 text-[var(--accent-main)]"
+                />
+                <div className="leading-tight">
+                  <span className="font-semibold text-white block">Game-Ready IoStore (.utoc / .ucas / .pak)</span>
+                  <span className="text-[10px] text-gray-400">Directly loadable in game via mod managers</span>
+                </div>
+              </label>
+
+              <label className="flex items-center gap-2 p-2 border cursor-pointer" style={{ backgroundColor: 'var(--bg-3)', borderColor: targetFormat === 'raw_uassets' ? 'var(--accent-main)' : 'var(--bg-1)' }}>
+                <input
+                  type="radio"
+                  name="twelveColorTarget"
+                  checked={targetFormat === 'raw_uassets'}
+                  onChange={() => setTargetFormat('raw_uassets')}
+                  className="w-4 h-4 text-[var(--accent-main)]"
+                />
+                <div className="leading-tight">
+                  <span className="font-semibold text-white block">Raw Loose UAssets Only</span>
+                  <span className="text-[10px] text-gray-400">Marvel/Content/... folder hierarchy</span>
+                </div>
+              </label>
+            </div>
+
+            {targetFormat === 'iostore' && (
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
+                <label className="flex items-center gap-2 p-1.5 border cursor-pointer" style={{ backgroundColor: 'var(--bg-3)', borderColor: 'var(--bg-1)' }}>
+                  <input
+                    type="checkbox"
+                    checked={compressOodle}
+                    onChange={e => setCompressOodle(e.target.checked)}
+                    className="w-3.5 h-3.5"
+                  />
+                  <span>Compress (Oodle Kraken)</span>
+                </label>
+
+                <label className="flex items-center gap-2 p-1.5 border cursor-pointer" style={{ backgroundColor: 'var(--bg-3)', borderColor: 'var(--bg-1)' }}>
+                  <input
+                    type="checkbox"
+                    checked={createZip}
+                    onChange={e => setCreateZip(e.target.checked)}
+                    className="w-3.5 h-3.5"
+                  />
+                  <span>Create .zip Archive</span>
+                </label>
+
+                <label className="flex items-center gap-2 p-1.5 border cursor-pointer" style={{ backgroundColor: 'var(--bg-3)', borderColor: 'var(--bg-1)' }}>
+                  <input
+                    type="checkbox"
+                    checked={bundleAll12}
+                    disabled={!createZip}
+                    onChange={e => setBundleAll12(e.target.checked)}
+                    className="w-3.5 h-3.5"
+                  />
+                  <span>Bundle All 12 in 1 .zip</span>
+                </label>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+              <label className="flex items-center gap-2 p-1.5 border cursor-pointer" style={{ backgroundColor: 'var(--bg-3)', borderColor: 'var(--bg-1)' }}>
+                <input
+                  type="checkbox"
+                  checked={pakReady}
+                  onChange={e => setPakReady(e.target.checked)}
+                  className="w-3.5 h-3.5"
+                />
+                <span>Universal Pak-Ready Structure (Marvel/Content/...)</span>
+              </label>
+
+              <label className="flex items-center gap-2 p-1.5 border cursor-pointer" style={{ backgroundColor: 'var(--bg-3)', borderColor: 'var(--bg-1)' }}>
+                <input
+                  type="checkbox"
+                  checked={exportRvfxp}
+                  onChange={e => setExportRvfxp(e.target.checked)}
+                  className="w-3.5 h-3.5"
+                />
+                <span>Export Recipe V2 (.rvfxp) Presets</span>
+              </label>
+            </div>
           </div>
 
           {/* 12 Color Palette Grid */}

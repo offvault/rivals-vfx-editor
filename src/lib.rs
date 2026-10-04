@@ -3798,6 +3798,320 @@ async fn update_vfx_mod(
 }
 
 // ============================================================================
+// 1-CLICK MOD PACKAGING & MULTI-MOD BUNDLE ZIPPING
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModPackageOptions {
+    pub mod_name: String,
+    pub output_dir: String,
+    pub json_paths: Vec<String>, // "jsonPath,outRelPath"
+    pub target_format: String,   // "iostore" or "raw_uassets"
+    pub compress: bool,          // enable Oodle Kraken (default: true)
+    pub create_zip: bool,        // create <ModName>.zip
+    pub bundle_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModPackageResult {
+    pub success: bool,
+    pub mod_name: String,
+    pub utoc_path: Option<String>,
+    pub ucas_path: Option<String>,
+    pub pak_path: Option<String>,
+    pub zip_path: Option<String>,
+    pub raw_dir: Option<String>,
+    pub message: Option<String>,
+}
+
+fn create_zip_archive(zip_path: &Path, files: &[(PathBuf, String)]) -> Result<(), String> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    if let Some(parent) = zip_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let file = fs::File::create(zip_path).map_err(|e| format!("Failed to create zip file: {}", e))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o755);
+
+    for (disk_path, archive_name) in files {
+        if !disk_path.exists() {
+            continue;
+        }
+        zip.start_file(archive_name, options)
+            .map_err(|e| format!("Failed to add file {} to zip: {}", archive_name, e))?;
+        let data = fs::read(disk_path)
+            .map_err(|e| format!("Failed to read file {}: {}", disk_path.display(), e))?;
+        zip.write_all(&data)
+            .map_err(|e| format!("Failed to write file {} to zip: {}", archive_name, e))?;
+    }
+
+    zip.finish().map_err(|e| format!("Failed to finalize zip file: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn create_bundle_zip(
+    bundle_name: String,
+    output_dir: String,
+    file_paths: Vec<String>,
+) -> Result<String, String> {
+    let clean_bundle = bundle_name.trim().replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_");
+    let zip_filename = if clean_bundle.ends_with(".zip") {
+        clean_bundle
+    } else {
+        format!("{}.zip", clean_bundle)
+    };
+    let zip_path = Path::new(&output_dir).join(&zip_filename);
+
+    let mut entries = Vec::new();
+    for fp in file_paths {
+        let p = PathBuf::from(&fp);
+        if p.exists() {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            entries.push((p, name));
+        }
+    }
+
+    if entries.is_empty() {
+        return Err("No valid files provided to bundle into zip".to_string());
+    }
+
+    create_zip_archive(&zip_path, &entries)?;
+    Ok(zip_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn package_iostore_mod(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    options: ModPackageOptions,
+) -> Result<ModPackageResult, String> {
+    let mod_name = options.mod_name.trim().replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "_");
+    let output_dir_path = PathBuf::from(&options.output_dir);
+    fs::create_dir_all(&output_dir_path).map_err(|e| e.to_string())?;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let stage_root = get_cache_dir()
+        .join("rvfxe_mod_stage")
+        .join(format!("{}_{}_{}", std::process::id(), now_ms, mod_name));
+    fs::create_dir_all(&stage_root).map_err(|e| e.to_string())?;
+
+    // Step 1: Parse input json_paths and stage them
+    let mut staged_json_files: Vec<String> = Vec::new();
+
+    const CHUNK_SIZE: usize = 1000;
+    for chunk in options.json_paths.chunks(CHUNK_SIZE) {
+        for line in chunk {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let src_json_path = PathBuf::from(parts[0]);
+            let rel_target = parts[1].replace('\\', "/");
+
+            let trimmed_rel = if rel_target.starts_with(&mod_name) {
+                rel_target[mod_name.len()..].trim_start_matches('/').to_string()
+            } else {
+                rel_target
+            };
+
+            let staged_json = stage_root.join(trimmed_rel).with_extension("json");
+            if let Some(parent) = staged_json.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+
+            if src_json_path.exists() {
+                if let Ok(_) = fs::copy(&src_json_path, &staged_json) {
+                    staged_json_files.push(staged_json.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    if staged_json_files.is_empty() {
+        let _ = fs::remove_dir_all(&stage_root);
+        return Err("No valid JSON files could be staged for mod packaging".to_string());
+    }
+
+    // Step 2: Convert staged JSONs to .uasset in stage_root
+    let (usmap_path, tool_path) = {
+        let settings = state.settings.lock().unwrap();
+        (settings.usmap_path.clone(), get_uasset_tool_path(&app))
+    };
+
+    let _ = app.emit(
+        "conversion-progress",
+        ConversionProgress {
+            progress_type: Some("progress".to_string()),
+            current: 0,
+            total: staged_json_files.len(),
+            file_name: format!("Converting {} assets to UAsset for {}...", staged_json_files.len(), mod_name),
+            cached: false,
+            error: None,
+        },
+    );
+
+    for (chunk_idx, chunk) in staged_json_files.chunks(CHUNK_SIZE).enumerate() {
+        let mut process_guard = state.tool_process.lock().await;
+        let proc = get_or_spawn_tool(&mut process_guard, &tool_path).await?;
+
+        let request = serde_json::json!({
+            "action": "batch_from_json",
+            "file_paths": chunk,
+            "output_path": stage_root.to_string_lossy().to_string(),
+            "usmap_path": usmap_path.clone(),
+            "base_path": stage_root.to_string_lossy().to_string(),
+        });
+
+        let resp = send_tool_request(proc, &request).await;
+        drop(process_guard);
+
+        if let Err(e) = resp {
+            eprintln!("[DEBUG] batch_from_json error for chunk {}: {}", chunk_idx, e);
+        }
+    }
+
+    // Explicit cleanup of staged json files to save disk and memory
+    for sj in &staged_json_files {
+        let _ = fs::remove_file(sj);
+    }
+
+    let uasset_files = find_files_recursive(&stage_root, ".uasset");
+    if uasset_files.is_empty() {
+        let _ = fs::remove_dir_all(&stage_root);
+        return Err("UAsset conversion failed to produce any .uasset files".to_string());
+    }
+
+    let mut result = ModPackageResult {
+        success: true,
+        mod_name: mod_name.clone(),
+        utoc_path: None,
+        ucas_path: None,
+        pak_path: None,
+        zip_path: None,
+        raw_dir: None,
+        message: None,
+    };
+
+    if options.target_format == "raw_uassets" {
+        let target_raw = output_dir_path.join(&mod_name);
+        fs::create_dir_all(&target_raw).map_err(|e| e.to_string())?;
+
+        for uasset in &uasset_files {
+            if let Ok(rel) = uasset.strip_prefix(&stage_root) {
+                let dest = target_raw.join(rel);
+                if let Some(parent) = dest.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::copy(uasset, &dest);
+                let uexp = uasset.with_extension("uexp");
+                if uexp.exists() {
+                    let _ = fs::copy(&uexp, dest.with_extension("uexp"));
+                }
+            }
+        }
+        result.raw_dir = Some(target_raw.to_string_lossy().to_string());
+        result.message = Some(format!("Exported {} raw uassets to {}", uasset_files.len(), target_raw.display()));
+    } else {
+        // Game-ready IoStore mod (.utoc + .ucas + .pak)
+        let package_base_name = if mod_name.ends_with("_9999999_P") || mod_name.ends_with("_P") {
+            mod_name.clone()
+        } else {
+            format!("{}_9999999_P", mod_name)
+        };
+
+        let output_base = output_dir_path.join(&package_base_name);
+
+        let mut cli_args = vec![
+            "create_mod_iostore".to_string(),
+            output_base.to_string_lossy().to_string(),
+            stage_root.to_string_lossy().to_string(),
+        ];
+
+        if !options.compress {
+            cli_args.push("--no-compress".to_string());
+        }
+
+        let cli_args_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
+
+        let _ = app.emit(
+            "conversion-progress",
+            ConversionProgress {
+                progress_type: Some("progress".to_string()),
+                current: 1,
+                total: 2,
+                file_name: format!("Creating IoStore container for {}...", mod_name),
+                cached: false,
+                error: None,
+            },
+        );
+
+        let (stdout, stderr) = run_uasset_tool_cli(&tool_path, &cli_args_refs).await?;
+        eprintln!("[DEBUG] create_mod_iostore stdout: {}", stdout);
+        if !stderr.is_empty() {
+            eprintln!("[DEBUG] create_mod_iostore stderr: {}", stderr);
+        }
+
+        let utoc_file = output_base.with_extension("utoc");
+        let ucas_file = output_base.with_extension("ucas");
+        let pak_file = output_base.with_extension("pak");
+
+        if utoc_file.exists() {
+            result.utoc_path = Some(utoc_file.to_string_lossy().to_string());
+        }
+        if ucas_file.exists() {
+            result.ucas_path = Some(ucas_file.to_string_lossy().to_string());
+        }
+        if pak_file.exists() {
+            result.pak_path = Some(pak_file.to_string_lossy().to_string());
+        }
+
+        if options.create_zip && options.bundle_name.is_none() {
+            let zip_path = output_dir_path.join(format!("{}.zip", mod_name));
+            let mut zip_entries: Vec<(PathBuf, String)> = Vec::new();
+
+            if utoc_file.exists() {
+                zip_entries.push((utoc_file.clone(), utoc_file.file_name().unwrap().to_string_lossy().to_string()));
+            }
+            if ucas_file.exists() {
+                zip_entries.push((ucas_file.clone(), ucas_file.file_name().unwrap().to_string_lossy().to_string()));
+            }
+            if pak_file.exists() {
+                zip_entries.push((pak_file.clone(), pak_file.file_name().unwrap().to_string_lossy().to_string()));
+            }
+
+            let rvfxp_candidate = output_dir_path.join(format!("{}.rvfxp", mod_name));
+            if rvfxp_candidate.exists() {
+                zip_entries.push((rvfxp_candidate.clone(), format!("{}.rvfxp", mod_name)));
+            }
+
+            if !zip_entries.is_empty() {
+                if let Ok(_) = create_zip_archive(&zip_path, &zip_entries) {
+                    result.zip_path = Some(zip_path.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        result.message = Some(format!(
+            "Successfully packaged {} into game-ready IoStore mod (3 files: .utoc, .ucas, .pak)",
+            mod_name
+        ));
+    }
+
+    let _ = fs::remove_dir_all(&stage_root);
+
+    Ok(result)
+}
+
+// ============================================================================
 // APP INITIALIZATION
 // ============================================================================
 
@@ -3854,6 +4168,8 @@ pub fn run() {
             get_manual_cache_info,
             clear_manual_cache,
             update_vfx_mod,
+            package_iostore_mod,
+            create_bundle_zip,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

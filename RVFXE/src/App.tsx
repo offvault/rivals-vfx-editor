@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type {
   ColorParam, RGBA, AppSettings, CacheInfo, ConversionProgress,
   FilterDictionary, SortConfig, UassetSourceMap, FileObject, SessionEntry,
-  UsmapStatus, BatchHeroSlot,
+  UsmapStatus, BatchHeroSlot, RvfxpPresetV2, RvfxpRecipe,
 } from '@/types';
 import { useHistory } from '@/hooks/useHistory';
 import { useDebugLog } from '@/hooks/useDebugLog';
@@ -14,7 +14,7 @@ import {
   rgbToHsl,
   generateProceduralColors,
 } from '@/utils/color';
-import { setNestedValue, getFileName, normalizePath, pathsMatchSuffix } from '@/utils/helpers';
+import { setNestedValue, getFileName, normalizePath, pathsMatchSuffix, getPakReadyRelativePath } from '@/utils/helpers';
 import { parseJsonAndExtractColors } from '@/services/colorParser';
 import * as tauri from '@/services/tauri';
 import { Header } from '@/components/Header';
@@ -34,6 +34,7 @@ import {
   AutoTwelveColorModal,
   RvfxpImportModal,
   VfxUpdaterModal,
+  SaveModModal,
 } from '@/components/modals';
 import '../css/tailwind.min.css';
 import '../css/fonts.css';
@@ -55,6 +56,7 @@ interface HeroSlotWorkspace {
   heroId: string;
   heroName: string;
   customLabel: string;
+  bundleGroup?: string;
   koMode: boolean;
   colorParams: ColorParam[];
   originalFiles: Record<string, any>;
@@ -138,11 +140,17 @@ export function App() {
   const [showFilterSettings, setShowFilterSettings] = useState(false);
   const [showTwelveColorModal, setShowTwelveColorModal] = useState(false);
   const [showVfxUpdater, setShowVfxUpdater] = useState(false);
+  const [updaterInitialModPath, setUpdaterInitialModPath] = useState<string | null>(null);
+
+  // === SAVE MOD MODAL STATE ===
+  const [showSaveModModal, setShowSaveModModal] = useState(false);
+  const [saveModalIsBatch, setSaveModalIsBatch] = useState(false);
 
   // === SMART RVFXP IMPORT STATE ===
   const [showRvfxpImport, setShowRvfxpImport] = useState(false);
   const [pendingRvfxp, setPendingRvfxp] = useState<{
     filePath: string;
+    presetV2?: RvfxpPresetV2 | null;
     sessionData: SessionEntry[];
     detectedHeroId: string | null;
     detectedHeroName: string | null;
@@ -607,6 +615,7 @@ export function App() {
           heroId: slot.heroId,
           heroName: slot.heroName,
           customLabel: cleanLabel,
+          bundleGroup: slot.bundleGroup,
           koMode,
           colorParams: slotParams,
           originalFiles: slotOriginalFiles,
@@ -719,71 +728,225 @@ export function App() {
     }
   }, [debug, filterDictionary, setInitialHistory]);
 
-  // === SAVE SINGLE ACTIVE HERO (INTO ITS OWN MOD FOLDER) ===
-  const handleSaveAsUasset = useCallback(async (saveAll = false) => {
+  // === SAVE SINGLE & BATCH MOD EXPORT HANDLERS ===
+  const handleTriggerSave = useCallback(() => {
     const uassetKeys = Object.keys(uassetSourceMap);
     if (uassetKeys.length === 0) { alert('No files loaded.'); return; }
+    setSaveModalIsBatch(false);
+    setShowSaveModModal(true);
+  }, [uassetSourceMap]);
 
+  const handleTriggerBatchSave = useCallback(() => {
+    if (batchSlots.length === 0) return;
+    setSaveModalIsBatch(true);
+    setShowSaveModModal(true);
+  }, [batchSlots.length]);
+
+  const handleConfirmSaveMod = useCallback(async (options: {
+    targetFormat: 'iostore' | 'raw_uassets';
+    compressOodle: boolean;
+    createZip: boolean;
+    pakReady: boolean;
+    bundleName?: string;
+  }) => {
     try {
       const outputPath = await tauri.openDialog({
         directory: true,
         multiple: false,
-        title: 'Select Destination Folder (e.g. Done/)',
+        title: saveModalIsBatch
+          ? 'Select Destination Folder for All Mod Packs (e.g. Done/)'
+          : 'Select Destination Folder (e.g. Done/)',
       }) as string;
       if (!outputPath) return;
 
       setIsConverting(true);
-      const isPakReady = settings.pakReadyStructure ?? true;
-      const cleanModFolder = sessionName.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
 
-      const filesToSave = saveAll ? uassetKeys : uassetKeys.filter(k => {
-        const orig = originalFiles[k];
-        if (!orig) return false;
-        return colorParams.some(p => p.relativePath === k);
-      });
+      if (!saveModalIsBatch) {
+        // ===== SINGLE HERO SAVE =====
+        const cleanModFolder = sessionName.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
+        const uassetKeys = Object.keys(uassetSourceMap);
+        if (uassetKeys.length === 0) { alert('No files loaded.'); return; }
 
-      const modifiedFiles: Record<string, any> = {};
-      for (const k of filesToSave) {
-        if (originalFiles[k]) modifiedFiles[k] = structuredClone(originalFiles[k]);
-      }
-      colorParams.forEach(p => {
-        if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
-      });
-
-      const jsonPathsForConversion: string[] = [];
-      for (const keyPath of filesToSave) {
-        const sourceInfo = uassetSourceMap[keyPath];
-        if (sourceInfo?.jsonPath && modifiedFiles[keyPath]) {
-          const jsonContent = JSON.stringify(modifiedFiles[keyPath], null, 2);
-          await tauri.writeTextFile(sourceInfo.jsonPath, jsonContent);
-
-          let outRelPath = keyPath.replace(/\.json$/i, '.uasset');
-          if (isPakReady) {
-            const heroSubPart = outRelPath.replace(/^.*Characters\//i, '').replace(/^.*Custom\//i, '');
-            outRelPath = `${cleanModFolder}/Marvel/Content/Marvel/VFX/Materials/Characters/${heroSubPart}`;
-          } else {
-            outRelPath = `${cleanModFolder}/${outRelPath}`;
-          }
-          jsonPathsForConversion.push(`${sourceInfo.jsonPath},${outRelPath}`);
+        const modifiedFiles: Record<string, any> = {};
+        for (const k of uassetKeys) {
+          if (originalFiles[k]) modifiedFiles[k] = structuredClone(originalFiles[k]);
         }
+        colorParams.forEach(p => {
+          if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
+        });
+
+        const jsonPathsForConversion: string[] = [];
+        for (const keyPath of uassetKeys) {
+          const sourceInfo = uassetSourceMap[keyPath];
+          if (sourceInfo?.jsonPath && modifiedFiles[keyPath]) {
+            const jsonContent = JSON.stringify(modifiedFiles[keyPath], null, 2);
+            await tauri.writeTextFile(sourceInfo.jsonPath, jsonContent);
+
+            const outRelPath = options.pakReady
+              ? getPakReadyRelativePath(keyPath, cleanModFolder)
+              : `${cleanModFolder}/${keyPath.replace(/\.json$/i, '.uasset')}`;
+            jsonPathsForConversion.push(`${sourceInfo.jsonPath},${outRelPath}`);
+          }
+        }
+
+        // Write Version 2 .rvfxp preset
+        const sessionData: SessionEntry[] = colorParams.map(p => ({
+          relativePath: p.relativePath.replace(/\.json$/i, ''),
+          paramName: p.paramName,
+          rgba: p.rgba,
+        }));
+        const presetV2: RvfxpPresetV2 = {
+          version: 2,
+          generator: 'RivalsVFXEditor',
+          timestamp: new Date().toISOString(),
+          recipe: {
+            mode: isProceduralShuffle ? 'procedural' : shuffleColors.length > 1 ? 'shuffle' : 'single',
+            masterColor,
+            shufflePalette: [...shuffleColors],
+            preserveIntensity,
+            ignoreGrayscale,
+            proceduralJitter,
+            brightnessMultiplier,
+            opacityValue,
+            hueShift: hueShiftValue,
+          },
+          slots: [
+            {
+              slotId: activeSlotId || 'slot_active',
+              heroId: currentHeroId || 'unknown',
+              heroName: currentHeroName || 'Unknown Hero',
+              customLabel: cleanModFolder,
+            },
+          ],
+          savedParameters: sessionData,
+        };
+
+        const presetPath = `${outputPath}/${cleanModFolder}.rvfxp`;
+        await tauri.writeTextFile(presetPath, JSON.stringify(presetV2, null, 2));
+
+        if (jsonPathsForConversion.length > 0) {
+          await tauri.packageIostoreMod({
+            mod_name: cleanModFolder,
+            output_dir: outputPath,
+            json_paths: jsonPathsForConversion,
+            target_format: options.targetFormat,
+            compress: options.compressOodle,
+            create_zip: options.createZip,
+          });
+        }
+
+        setSaveStatus(`Saved ${cleanModFolder} successfully!`);
+        await tauri.openFolder(outputPath);
+        debug.addLog(`✓ Exported ${cleanModFolder} to ${outputPath}`);
+      } else {
+        // ===== BATCH SAVE ALL SLOTS =====
+        const totalSlots = batchSlots.length;
+        const allContainerFiles: string[] = [];
+
+        for (let sIdx = 0; sIdx < totalSlots; sIdx++) {
+          const slot = batchSlots[sIdx];
+          const cleanModFolder = slot.customLabel.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
+
+          setConversionProgress({
+            current: sIdx + 1,
+            total: totalSlots,
+            fileName: `[${sIdx + 1}/${totalSlots}] Exporting ${cleanModFolder}...`,
+          });
+
+          const modifiedFiles: Record<string, any> = {};
+          for (const k of Object.keys(slot.originalFiles)) {
+            modifiedFiles[k] = structuredClone(slot.originalFiles[k]);
+          }
+          slot.colorParams.forEach(p => {
+            if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
+          });
+
+          const jsonPathsForConversion: string[] = [];
+          const filesToSave = Object.keys(modifiedFiles).filter(k => slot.uassetSourceMap[k]?.jsonPath);
+
+          for (const keyPath of filesToSave) {
+            const sourceInfo = slot.uassetSourceMap[keyPath];
+            if (sourceInfo?.jsonPath) {
+              const jsonContent = JSON.stringify(modifiedFiles[keyPath], null, 2);
+              await tauri.writeTextFile(sourceInfo.jsonPath, jsonContent);
+
+              const outRelPath = options.pakReady
+                ? getPakReadyRelativePath(keyPath, cleanModFolder)
+                : `${cleanModFolder}/${keyPath.replace(/\.json$/i, '.uasset')}`;
+              jsonPathsForConversion.push(`${sourceInfo.jsonPath},${outRelPath}`);
+            }
+          }
+
+          // Auto-write .rvfxp preset V2 for this slot
+          const slotSessionData: SessionEntry[] = slot.colorParams.map(p => ({
+            relativePath: p.relativePath.replace(/\.json$/i, ''),
+            paramName: p.paramName,
+            rgba: p.rgba,
+          }));
+          const slotPreset: RvfxpPresetV2 = {
+            version: 2,
+            generator: 'RivalsVFXEditor',
+            timestamp: new Date().toISOString(),
+            recipe: {
+              mode: isProceduralShuffle ? 'procedural' : shuffleColors.length > 1 ? 'shuffle' : 'single',
+              masterColor,
+              shufflePalette: [...shuffleColors],
+              preserveIntensity,
+              ignoreGrayscale,
+              proceduralJitter,
+              brightnessMultiplier,
+              opacityValue,
+              hueShift: hueShiftValue,
+            },
+            slots: [
+              {
+                slotId: slot.slotId,
+                heroId: slot.heroId,
+                heroName: slot.heroName,
+                customLabel: cleanModFolder,
+              },
+            ],
+            savedParameters: slotSessionData,
+          };
+          await tauri.writeTextFile(
+            `${outputPath}/${cleanModFolder}.rvfxp`,
+            JSON.stringify(slotPreset, null, 2)
+          );
+
+          if (jsonPathsForConversion.length > 0) {
+            const packRes = await tauri.packageIostoreMod({
+              mod_name: cleanModFolder,
+              output_dir: outputPath,
+              json_paths: jsonPathsForConversion,
+              target_format: options.targetFormat,
+              compress: options.compressOodle,
+              create_zip: !options.bundleName && options.createZip,
+              bundle_name: options.bundleName || null,
+            });
+
+            if (packRes.utocPath) allContainerFiles.push(packRes.utocPath);
+            if (packRes.ucasPath) allContainerFiles.push(packRes.ucasPath);
+            if (packRes.pakPath) allContainerFiles.push(packRes.pakPath);
+          }
+
+          debug.addLog(`✓ Exported ${cleanModFolder} into separate mod folder`);
+        }
+
+        // If bundle name requested, create unified bundle zip archive
+        if (options.targetFormat === 'iostore' && options.bundleName && allContainerFiles.length > 0) {
+          setConversionProgress({
+            current: totalSlots,
+            total: totalSlots,
+            fileName: `Building unified bundle archive: ${options.bundleName}.zip...`,
+          });
+          await tauri.createBundleZip(options.bundleName, outputPath, allContainerFiles);
+          debug.addLog(`✓ Created bundle zip archive: ${options.bundleName}.zip (${allContainerFiles.length} files)`);
+        }
+
+        setSaveStatus(`All ${totalSlots} mod packs saved!`);
+        await tauri.openFolder(outputPath);
+        debug.addLog(`✓ All ${totalSlots} mod packs saved in ${outputPath}`);
       }
-
-      if (jsonPathsForConversion.length > 0) {
-        await tauri.batchConvertJsonsToUassets(jsonPathsForConversion, outputPath);
-      }
-
-      // Write matching .rvfxp project profile
-      const modRoot = isPakReady ? `${outputPath}/${cleanModFolder}` : outputPath;
-      const sessionData: SessionEntry[] = colorParams.map(p => ({
-        relativePath: p.relativePath.replace(/\.json$/i, ''),
-        paramName: p.paramName,
-        rgba: p.rgba,
-      }));
-      await tauri.writeTextFile(`${modRoot}/${cleanModFolder}.rvfxp`, JSON.stringify(sessionData, null, 2));
-
-      setSaveStatus(`Saved ${cleanModFolder} successfully!`);
-      await tauri.openFolder(outputPath);
-      alert(`Success! Mod saved in:\n${outputPath}\\${cleanModFolder}`);
     } catch (err: any) {
       alert(`Save error: ${err.message || err}`);
     } finally {
@@ -791,110 +954,111 @@ export function App() {
       setConversionProgress({ current: 0, total: 0, fileName: '' });
       setTimeout(() => setSaveStatus(''), 8000);
     }
-  }, [uassetSourceMap, settings.pakReadyStructure, sessionName, originalFiles, colorParams]);
+  }, [
+    saveModalIsBatch, sessionName, uassetSourceMap, originalFiles, colorParams,
+    activeSlotId, currentHeroId, currentHeroName, isProceduralShuffle, shuffleColors,
+    preserveIntensity, ignoreGrayscale, proceduralJitter, brightnessMultiplier,
+    opacityValue, hueShiftValue, masterColor, batchSlots, debug,
+  ]);
 
-  // === ⚡ BATCH SAVE ALL SLOTS (EVERY HERO GETS ITS OWN FOLDER) ===
-  const handleBatchSaveAll = useCallback(async () => {
-    if (batchSlots.length === 0) return;
+  const applyRecipeToCurrentParams = useCallback((recipe: RvfxpRecipe) => {
+    debug.addLog(`Applying recipe (${recipe.mode}) to current parameters...`);
+    const masterRgba = hexToRgba(recipe.masterColor);
+    const enemyRgba = recipe.enemyColor ? hexToRgba(recipe.enemyColor) : null;
 
-    try {
-      const outputPath = await tauri.openDialog({
-        directory: true,
-        multiple: false,
-        title: 'Select Destination Folder for All Mod Packs (e.g. Done/)',
-      }) as string;
-      if (!outputPath) return;
-
-      setIsConverting(true);
-      const isPakReady = settings.pakReadyStructure ?? true;
-      const totalSlots = batchSlots.length;
-
-      for (let sIdx = 0; sIdx < totalSlots; sIdx++) {
-        const slot = batchSlots[sIdx];
-        const cleanModFolder = slot.customLabel.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
-
-        setConversionProgress({
-          current: sIdx + 1,
-          total: totalSlots,
-          fileName: `[${sIdx + 1}/${totalSlots}] Exporting ${cleanModFolder}...`,
-        });
-
-        // Build modified file data for this isolated slot
-        const modifiedFiles: Record<string, any> = {};
-        for (const k of Object.keys(slot.originalFiles)) {
-          modifiedFiles[k] = structuredClone(slot.originalFiles[k]);
-        }
-        slot.colorParams.forEach(p => {
-          if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
-        });
-
-        const jsonPathsForConversion: string[] = [];
-        const filesToSave = Object.keys(modifiedFiles).filter(k => slot.uassetSourceMap[k]?.jsonPath);
-
-        for (const keyPath of filesToSave) {
-          const sourceInfo = slot.uassetSourceMap[keyPath];
-          if (sourceInfo?.jsonPath) {
-            const jsonContent = JSON.stringify(modifiedFiles[keyPath], null, 2);
-            await tauri.writeTextFile(sourceInfo.jsonPath, jsonContent);
-
-            let outRelPath = keyPath.replace(/\.json$/i, '.uasset');
-            if (isPakReady) {
-              const heroSubPart = outRelPath.replace(/^.*Characters\//i, '').replace(/^.*Custom\//i, '');
-              outRelPath = `${cleanModFolder}/Marvel/Content/Marvel/VFX/Materials/Characters/${heroSubPart}`;
-            } else {
-              outRelPath = `${cleanModFolder}/${outRelPath}`;
-            }
-            jsonPathsForConversion.push(`${sourceInfo.jsonPath},${outRelPath}`);
-          }
-        }
-
-        if (jsonPathsForConversion.length > 0) {
-          await tauri.batchConvertJsonsToUassets(jsonPathsForConversion, outputPath);
-        }
-
-        // Auto-write .rvfxp file in each separate folder
-        try {
-          const modRoot = isPakReady ? `${outputPath}/${cleanModFolder}` : outputPath;
-          const sessionData: SessionEntry[] = slot.colorParams.map(p => ({
-            relativePath: p.relativePath.replace(/\.json$/i, ''),
-            paramName: p.paramName,
-            rgba: p.rgba,
-          }));
-          await tauri.writeTextFile(`${modRoot}/${cleanModFolder}.rvfxp`, JSON.stringify(sessionData, null, 2));
-        } catch (e) {}
-
-        debug.addLog(`✓ Exported ${cleanModFolder} into separate mod folder`);
+    let newParams = colorParams.map(param => {
+      const isEnemy = /enemy/i.test(param.paramName) || /enemy/i.test(param.relativePath);
+      let targetRgba = masterRgba;
+      if (isEnemy && enemyRgba) {
+        targetRgba = enemyRgba;
       }
+      let resRgba = applyColorToParam(param.rgba, targetRgba, {
+        preserveIntensity: recipe.preserveIntensity,
+        ignoreGrayscale: recipe.ignoreGrayscale,
+      });
+      if (recipe.brightnessMultiplier !== 1.0) {
+        resRgba = {
+          ...resRgba,
+          R: Math.min(100, Math.max(0, resRgba.R * recipe.brightnessMultiplier)),
+          G: Math.min(100, Math.max(0, resRgba.G * recipe.brightnessMultiplier)),
+          B: Math.min(100, Math.max(0, resRgba.B * recipe.brightnessMultiplier)),
+        };
+      }
+      if (recipe.opacityValue !== 1.0) {
+        resRgba = { ...resRgba, A: recipe.opacityValue };
+      }
+      return { ...param, rgba: resRgba };
+    });
 
-      setSaveStatus(`All ${totalSlots} mod packs saved!`);
-      await tauri.openFolder(outputPath);
-      alert(`Success! All ${totalSlots} mod packs exported into separate folders in:\n${outputPath}`);
-    } catch (err: any) {
-      alert(`Batch save error: ${err.message || err}`);
-    } finally {
-      setIsConverting(false);
-      setConversionProgress({ current: 0, total: 0, fileName: '' });
-      setTimeout(() => setSaveStatus(''), 10000);
+    if (recipe.mode === 'shuffle' && recipe.shufflePalette && recipe.shufflePalette.length > 0) {
+      const palette = recipe.shufflePalette;
+      newParams = newParams.map((p, idx) => {
+        const hex = palette[idx % palette.length];
+        return {
+          ...p,
+          rgba: applyColorToParam(p.rgba, hexToRgba(hex), {
+            preserveIntensity: recipe.preserveIntensity,
+            ignoreGrayscale: recipe.ignoreGrayscale,
+          }),
+        };
+      });
+    } else if (recipe.mode === 'procedural' && recipe.shufflePalette && recipe.shufflePalette.length > 0) {
+      const generatedColors = generateProceduralColors(recipe.shufflePalette, newParams.length, recipe.proceduralJitter || 0.35);
+      newParams = newParams.map((p, idx) => {
+        const hex = generatedColors[idx];
+        return {
+          ...p,
+          rgba: applyColorToParam(p.rgba, hexToRgba(hex), {
+            preserveIntensity: recipe.preserveIntensity,
+            ignoreGrayscale: recipe.ignoreGrayscale,
+          }),
+        };
+      });
     }
-  }, [batchSlots, settings.pakReadyStructure, debug]);
+
+    if (recipe.hueShift) {
+      newParams = newParams.map(p => ({
+        ...p,
+        rgba: applyHueShiftToRgba(p.rgba, recipe.hueShift, recipe.ignoreGrayscale),
+      }));
+    }
+
+    recordHistory(newParams);
+    debug.addLog(`✓ Applied recipe math across ${newParams.length} parameters!`);
+    alert(`Recipe applied successfully across all ${newParams.length} parameters!`);
+  }, [colorParams, recordHistory, debug]);
 
   // === SMART RVFXP IMPORT FLOW ===
   const handleImportSession = useCallback(async () => {
     try {
       const filePath = await tauri.openDialog({
-        title: 'Import Project File (.rvfxp)',
+        title: 'Import Project Preset (.rvfxp)',
         multiple: false,
         filters: [{ name: 'RVFX Project', extensions: ['rvfxp', 'json'] }],
       });
       if (!filePath) return;
       const content = await tauri.readTextFile(filePath as string);
-      const sessionData: SessionEntry[] = JSON.parse(content);
-      if (!Array.isArray(sessionData)) { alert('Invalid project file format.'); return; }
+      const parsed = JSON.parse(content);
+      let sessionData: SessionEntry[] = [];
+      let presetV2: RvfxpPresetV2 | null = null;
+      if (parsed && parsed.version === 2) {
+        presetV2 = parsed as RvfxpPresetV2;
+        sessionData = parsed.savedParameters || [];
+      } else if (Array.isArray(parsed)) {
+        sessionData = parsed;
+      } else {
+        alert('Invalid project file format.');
+        return;
+      }
 
       let detectedHeroId: string | null = null;
-      for (const entry of sessionData) {
-        const m = entry.relativePath.match(/(?:Characters|Custom)[\\/](\d{4})/i) || entry.relativePath.match(/^(\d{4})[\\/]/);
-        if (m) { detectedHeroId = m[1]; break; }
+      if (presetV2 && presetV2.slots && presetV2.slots.length > 0) {
+        detectedHeroId = presetV2.slots[0].heroId;
+      } else {
+        for (const entry of sessionData) {
+          const m = entry.relativePath.match(/(?:Characters|Custom)[\\/](\d{4})/i) || entry.relativePath.match(/^(\d{4})[\\/]/);
+          if (m) { detectedHeroId = m[1]; break; }
+        }
       }
 
       let detectedHeroName: string | null = null;
@@ -908,6 +1072,7 @@ export function App() {
 
       setPendingRvfxp({
         filePath: filePath as string,
+        presetV2,
         sessionData,
         detectedHeroId,
         detectedHeroName,
@@ -952,18 +1117,30 @@ export function App() {
     setPendingRvfxp(null);
   }, [pendingRvfxp, applyRvfxpToLoadedParams]);
 
-  const handleFreshReimportRvfxp = useCallback(async () => {
-    if (!pendingRvfxp || !pendingRvfxp.detectedHeroId) return;
-    const { detectedHeroId, detectedHeroName, sessionData } = pendingRvfxp;
+  const handleApplyRecipeFresh = useCallback(async (recipeToApply?: RvfxpRecipe) => {
+    if (!pendingRvfxp) return;
+    const targetRecipe = recipeToApply || pendingRvfxp.presetV2?.recipe;
+    const targetHeroId = pendingRvfxp.detectedHeroId;
+    const targetHeroName = pendingRvfxp.detectedHeroName || targetHeroId || 'Hero';
+
     setShowRvfxpImport(false);
-    await handleHeroSelect(detectedHeroId, detectedHeroName || detectedHeroId, false);
+
+    if (targetHeroId && targetHeroId !== currentHeroId) {
+      debug.addLog(`Re-extracting fresh files for hero ${targetHeroId} to apply recipe...`);
+      await handleHeroSelect(targetHeroId, targetHeroName, false);
+    }
+
     setTimeout(() => {
-      applyRvfxpToLoadedParams(sessionData);
+      if (targetRecipe) {
+        applyRecipeToCurrentParams(targetRecipe);
+      } else {
+        applyRvfxpToLoadedParams(pendingRvfxp.sessionData);
+      }
       setPendingRvfxp(null);
     }, 400);
-  }, [pendingRvfxp, handleHeroSelect, applyRvfxpToLoadedParams]);
+  }, [pendingRvfxp, currentHeroId, debug, handleHeroSelect, applyRecipeToCurrentParams, applyRvfxpToLoadedParams]);
 
-  // === EXPORT CURRENT SESSION FILE ===
+  // === EXPORT CURRENT SESSION FILE (VERSION 2 RECIPE PRESET) ===
   const handleExportSession = useCallback(async () => {
     if (selectedParams.size === 0) { alert('No parameters selected to export.'); return; }
     const sessionData: SessionEntry[] = colorParams.filter(p => selectedParams.has(p.id)).map(p => ({
@@ -971,20 +1148,53 @@ export function App() {
       paramName: p.paramName,
       rgba: p.rgba,
     }));
+
+    const cleanMod = sessionName.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
+    const presetV2: RvfxpPresetV2 = {
+      version: 2,
+      generator: 'RivalsVFXEditor',
+      timestamp: new Date().toISOString(),
+      recipe: {
+        mode: isProceduralShuffle ? 'procedural' : shuffleColors.length > 1 ? 'shuffle' : 'single',
+        masterColor,
+        shufflePalette: [...shuffleColors],
+        preserveIntensity,
+        ignoreGrayscale,
+        proceduralJitter,
+        brightnessMultiplier,
+        opacityValue,
+        hueShift: hueShiftValue,
+      },
+      slots: [
+        {
+          slotId: activeSlotId || 'slot_active',
+          heroId: currentHeroId || 'unknown',
+          heroName: currentHeroName || 'Unknown Hero',
+          customLabel: cleanMod,
+        },
+      ],
+      savedParameters: sessionData,
+    };
+
     try {
       const fileName = sessionName.endsWith('.rvfxp') ? sessionName : `${sessionName}.rvfxp`;
       const filePath = await tauri.saveDialog({
-        title: 'Export Project File',
+        title: 'Export Project Preset (.rvfxp)',
         defaultPath: fileName,
         filters: [{ name: 'RVFX Project', extensions: ['rvfxp'] }],
       });
       if (!filePath) return;
-      await tauri.writeTextFile(filePath as string, JSON.stringify(sessionData, null, 2));
-      alert('Project exported successfully!');
+      await tauri.writeTextFile(filePath as string, JSON.stringify(presetV2, null, 2));
+      alert('Project preset exported successfully (Version 2)!');
     } catch (err: any) {
       alert(`Failed to export session: ${err.message || err}`);
     }
-  }, [colorParams, selectedParams, sessionName]);
+  }, [
+    selectedParams, colorParams, sessionName, isProceduralShuffle, shuffleColors,
+    masterColor, preserveIntensity, ignoreGrayscale, proceduralJitter,
+    brightnessMultiplier, opacityValue, hueShiftValue, activeSlotId,
+    currentHeroId, currentHeroName,
+  ]);
 
   // === FULL RESET ===
   const handleReset = useCallback(() => {
@@ -1010,6 +1220,185 @@ export function App() {
     setOpacityValue(1.0);
     setUassetSourceMap({});
   }, [resetHistory]);
+
+  // === GLOBAL FILE DROP HANDLING ===
+  const handleFilesDropped = useCallback(async (filePaths: string[]) => {
+    if (!filePaths || filePaths.length === 0) return;
+    setIsDragging(false);
+
+    const rvfxpFiles = filePaths.filter(p => p.toLowerCase().endsWith('.rvfxp') || (p.toLowerCase().endsWith('.json') && !p.toLowerCase().includes('materials')));
+    const uassetFiles = filePaths.filter(p => p.toLowerCase().endsWith('.uasset'));
+    const containerFiles = filePaths.filter(p => p.toLowerCase().endsWith('.utoc') || p.toLowerCase().endsWith('.pak') || p.toLowerCase().endsWith('.ucas'));
+
+    if (containerFiles.length > 0) {
+      setUpdaterInitialModPath(containerFiles[0]);
+      setShowVfxUpdater(true);
+      debug.addLog(`Opened VFX Updater for dropped container: ${containerFiles[0]}`);
+      return;
+    }
+
+    if (rvfxpFiles.length === 1) {
+      try {
+        const filePath = rvfxpFiles[0];
+        const content = await tauri.readTextFile(filePath);
+        const parsed = JSON.parse(content);
+        let presetV2: RvfxpPresetV2 | null = null;
+        let sessionData: SessionEntry[] = [];
+        if (parsed && parsed.version === 2) {
+          presetV2 = parsed as RvfxpPresetV2;
+          sessionData = parsed.savedParameters || [];
+        } else if (Array.isArray(parsed)) {
+          sessionData = parsed;
+        }
+
+        let detectedHeroId: string | null = null;
+        if (presetV2 && presetV2.slots && presetV2.slots.length > 0) {
+          detectedHeroId = presetV2.slots[0].heroId;
+        } else {
+          for (const entry of sessionData) {
+            const m = entry.relativePath.match(/(?:Characters|Custom)[\\/](\d{4})/i) || entry.relativePath.match(/^(\d{4})[\\/]/);
+            if (m) { detectedHeroId = m[1]; break; }
+          }
+        }
+
+        let detectedHeroName: string | null = null;
+        if (detectedHeroId) {
+          try {
+            const roster = await tauri.getHeroRoster(false);
+            const hero = roster.heroes.find(h => h.hero_id === detectedHeroId);
+            if (hero) detectedHeroName = hero.display_name;
+          } catch (e) {}
+        }
+
+        setPendingRvfxp({
+          filePath,
+          presetV2,
+          sessionData,
+          detectedHeroId,
+          detectedHeroName,
+        });
+        setShowRvfxpImport(true);
+        debug.addLog(`Loaded preset for import: ${filePath}`);
+      } catch (e: any) {
+        alert(`Error reading preset file: ${e.message || e}`);
+      }
+      return;
+    }
+
+    if (rvfxpFiles.length > 1) {
+      debug.addLog(`Queueing ${rvfxpFiles.length} presets into batch slots...`);
+      const queuedSlots: BatchHeroSlot[] = [];
+      const roster = await tauri.getHeroRoster(false).catch(() => ({ heroes: [] }));
+      for (let i = 0; i < rvfxpFiles.length; i++) {
+        try {
+          const fp = rvfxpFiles[i];
+          const content = await tauri.readTextFile(fp);
+          const parsed = JSON.parse(content);
+          let hId = '1011';
+          let customLabel = fp.split(/[\\/]/).pop()?.replace(/\.rvfxp$/i, '') || `Mod_${i + 1}`;
+          if (parsed && parsed.version === 2 && parsed.slots?.[0]) {
+            hId = parsed.slots[0].heroId;
+            customLabel = parsed.slots[0].customLabel || customLabel;
+          } else if (Array.isArray(parsed)) {
+            for (const entry of parsed) {
+              const m = entry.relativePath.match(/(?:Characters|Custom)[\\/](\d{4})/i) || entry.relativePath.match(/^(\d{4})[\\/]/);
+              if (m) { hId = m[1]; break; }
+            }
+          }
+          const hName = roster.heroes.find(h => h.hero_id === hId)?.display_name || `Hero ${hId}`;
+          queuedSlots.push({
+            slotId: `slot_${Date.now()}_${i}`,
+            heroId: hId,
+            heroName: hName,
+            customLabel,
+          });
+        } catch (e) {}
+      }
+      if (queuedSlots.length > 0) {
+        await handleBatchLoadHeroes(queuedSlots, false);
+      }
+      return;
+    }
+
+    if (uassetFiles.length > 0) {
+      setIsConverting(true);
+      try {
+        const basePath = uassetFiles[0].substring(0, Math.max(uassetFiles[0].lastIndexOf('/'), uassetFiles[0].lastIndexOf('\\')));
+        const result = await tauri.batchConvertFiles(uassetFiles, basePath);
+        const fileObjs: FileObject[] = [];
+        const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
+        for (let i = 0; i < result.json_paths.length; i++) {
+          const content = await tauri.readTextFile(result.json_paths[i]);
+          const name = result.json_paths[i].split(/[\\/]/).pop() || '';
+          const rel = result.json_paths[i].replace(/\\/g, '/').split('/Content/').pop() || name;
+          fileObjs.push({ name, content, relativePath: rel });
+          srcMap[rel] = { uassetPath: result.uasset_paths[i], jsonPath: result.json_paths[i] };
+        }
+        setUassetSourceMap(srcMap);
+        const freshParams: ColorParam[] = [];
+        const freshFiles: Record<string, any> = {};
+        fileObjs.forEach(f => {
+          try {
+            const json = JSON.parse(f.content);
+            freshFiles[f.relativePath] = json;
+            parseJsonAndExtractColors(json, f.name, f.relativePath, freshParams, filterDictionary, debug.addLog);
+          } catch (e) {}
+        });
+        setOriginalFiles(freshFiles);
+        setInitialHistory(freshParams);
+        setSelectedParams(new Set(freshParams.map(p => p.id)));
+        debug.addLog(`Loaded ${freshParams.length} parameters from ${uassetFiles.length} dropped uassets.`);
+      } catch (err: any) {
+        alert(`Failed to load dropped files: ${err.message || err}`);
+      } finally {
+        setIsConverting(false);
+      }
+    }
+  }, [debug, filterDictionary, handleBatchLoadHeroes, setInitialHistory]);
+
+  // Global drag-drop event listeners (Tauri native + window fallback)
+  useEffect(() => {
+    const unlistenDropPromise = tauri.listen('tauri://drag-drop', (event: any) => {
+      setIsDragging(false);
+      const paths = event.payload?.paths;
+      if (Array.isArray(paths) && paths.length > 0) {
+        handleFilesDropped(paths);
+      }
+    });
+    const unlistenEnterPromise = tauri.listen('tauri://drag-enter', () => {
+      setIsDragging(true);
+    });
+    const unlistenLeavePromise = tauri.listen('tauri://drag-leave', () => {
+      setIsDragging(false);
+    });
+
+    const handleWindowDragOver = (e: DragEvent) => {
+      e.preventDefault();
+      setIsDragging(true);
+    };
+    const handleWindowDragLeave = (e: DragEvent) => {
+      if (e.clientX <= 0 || e.clientY <= 0 || e.clientX >= window.innerWidth || e.clientY >= window.innerHeight) {
+        setIsDragging(false);
+      }
+    };
+    const handleWindowDrop = (e: DragEvent) => {
+      e.preventDefault();
+      setIsDragging(false);
+    };
+
+    window.addEventListener('dragover', handleWindowDragOver);
+    window.addEventListener('dragleave', handleWindowDragLeave);
+    window.addEventListener('drop', handleWindowDrop);
+
+    return () => {
+      unlistenDropPromise.then((unlisten: () => void) => unlisten());
+      unlistenEnterPromise.then((unlisten: () => void) => unlisten());
+      unlistenLeavePromise.then((unlisten: () => void) => unlisten());
+      window.removeEventListener('dragover', handleWindowDragOver);
+      window.removeEventListener('dragleave', handleWindowDragLeave);
+      window.removeEventListener('drop', handleWindowDrop);
+    };
+  }, [handleFilesDropped]);
 
   return (
     <div style={{ backgroundColor: 'var(--bg-4)', color: 'var(--text-3)' }} className="h-screen p-6 flex flex-col overflow-hidden">
@@ -1140,7 +1529,7 @@ export function App() {
 
                       {/* BATCH SAVE ALL SLOTS BUTTON */}
                       <button
-                        onClick={handleBatchSaveAll}
+                        onClick={handleTriggerBatchSave}
                         disabled={isConverting}
                         className="px-3 py-1 text-xs font-bold uppercase tracking-wider flex-shrink-0 transition-all border"
                         style={{
@@ -1191,14 +1580,14 @@ export function App() {
                           </button>
 
                           <button
-                            onClick={(e) => handleSaveAsUasset(e.shiftKey)}
+                            onClick={handleTriggerSave}
                             disabled={isConverting}
-                            title="Save current hero mod folder"
+                            title="Save current hero mod (1-Click IoStore or Loose UAssets)"
                             className="flex items-center gap-2 px-6 py-2 font-medium rounded-none transition-colors shadow-md disabled:opacity-50 whitespace-nowrap"
                             style={{ backgroundColor: 'var(--accent-green)', color: 'var(--text-1)' }}
                           >
                             <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 21v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4M7 21h10M5 21H3V5a2 2 0 012-2h14a2 2 0 012 2v14a2 2 0 01-2 2h-2M12 11v-4M9 11h6" /></svg>
-                            Save UAsset
+                            Save Mod
                           </button>
                         </div>
                       </div>
@@ -1371,12 +1760,13 @@ export function App() {
       {showRvfxpImport && pendingRvfxp && (
         <RvfxpImportModal
           filePath={pendingRvfxp.filePath}
+          presetV2={pendingRvfxp.presetV2}
           sessionData={pendingRvfxp.sessionData}
           detectedHeroId={pendingRvfxp.detectedHeroId}
           detectedHeroName={pendingRvfxp.detectedHeroName}
           currentLoadedHeroId={currentHeroId}
-          onApplyCurrent={handleApplyRvfxpCurrent}
-          onFreshReimport={handleFreshReimportRvfxp}
+          onApplyExactMatch={handleApplyRvfxpCurrent}
+          onApplyRecipeFresh={handleApplyRecipeFresh}
           onClose={() => {
             setShowRvfxpImport(false);
             setPendingRvfxp(null);
@@ -1387,12 +1777,59 @@ export function App() {
       {showVfxUpdater && (
         <VfxUpdaterModal
           initialUsmapPath={settings.usmapPath}
-          onClose={() => setShowVfxUpdater(false)}
+          initialModPath={updaterInitialModPath}
+          onClose={() => {
+            setShowVfxUpdater(false);
+            setUpdaterInitialModPath(null);
+          }}
           addDebugLog={debug.addLog}
         />
       )}
 
+      <SaveModModal
+        isOpen={showSaveModModal}
+        onClose={() => setShowSaveModModal(false)}
+        onConfirm={handleConfirmSaveMod}
+        isBatch={saveModalIsBatch}
+        slotCount={saveModalIsBatch ? batchSlots.length : 1}
+        initialModName={
+          saveModalIsBatch
+            ? 'Batch_VFX_Mods'
+            : sessionName.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_')
+        }
+        initialBundleName={
+          saveModalIsBatch
+            ? batchSlots.find(s => s.bundleGroup)?.bundleGroup || ''
+            : ''
+        }
+      />
+
       {isConverting && <ConversionProgressOverlay conversionProgress={conversionProgress} />}
+
+      {/* Global Drag-and-Drop Visual Overlay */}
+      {isDragging && (
+        <div
+          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/85 backdrop-blur-sm pointer-events-none border-4 border-dashed"
+          style={{ borderColor: 'var(--accent-main)' }}
+        >
+          <div className="p-8 text-center space-y-3">
+            <div
+              className="w-16 h-16 mx-auto rounded-full flex items-center justify-center border-2"
+              style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--accent-main)', color: 'var(--accent-main)' }}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+            </div>
+            <h2 className="text-2xl font-bold text-white tracking-wide">
+              Drop Files into Marvel Rivals VFX Editor
+            </h2>
+            <p className="text-sm font-mono text-gray-300">
+              • Drop <span className="text-[var(--accent-main)] font-bold">.rvfxp</span> to load presets (multi-file drops batch queue)<br />
+              • Drop <span className="text-[var(--accent-main)] font-bold">.uasset</span> to extract and edit parameters<br />
+              • Drop <span className="text-[var(--accent-main)] font-bold">.pak / .utoc</span> to update out-of-date mods
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

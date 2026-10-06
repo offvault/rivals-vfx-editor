@@ -3802,27 +3802,44 @@ async fn update_vfx_mod(
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModPackageOptions {
+    #[serde(alias = "mod_name")]
     pub mod_name: String,
+    #[serde(alias = "output_dir")]
     pub output_dir: String,
+    #[serde(alias = "json_paths")]
     pub json_paths: Vec<String>, // "jsonPath,outRelPath"
+    #[serde(alias = "target_format")]
     pub target_format: String,   // "iostore" or "raw_uassets"
+    #[serde(default = "default_true", alias = "compress")]
     pub compress: bool,          // enable Oodle Kraken (default: true)
+    #[serde(default = "default_true", alias = "create_zip")]
     pub create_zip: bool,        // create <ModName>.zip
+    #[serde(default, alias = "bundle_name")]
     pub bundle_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModPackageResult {
     pub success: bool,
+    #[serde(alias = "mod_name")]
     pub mod_name: String,
+    #[serde(default, alias = "utoc_path")]
     pub utoc_path: Option<String>,
+    #[serde(default, alias = "ucas_path")]
     pub ucas_path: Option<String>,
+    #[serde(default, alias = "pak_path")]
     pub pak_path: Option<String>,
+    #[serde(default, alias = "zip_path")]
     pub zip_path: Option<String>,
+    #[serde(default, alias = "raw_dir")]
     pub raw_dir: Option<String>,
+    #[serde(default)]
     pub message: Option<String>,
 }
+
 
 fn create_zip_archive(zip_path: &Path, files: &[(PathBuf, String)]) -> Result<(), String> {
     use std::io::Write;

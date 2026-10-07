@@ -114,7 +114,12 @@ export interface BatchHeroSlot {
   heroName: string;
   customLabel: string;
   bundleGroup?: string;
+  recipe?: RvfxpRecipe;
+  sessionData?: SessionEntry[];
 }
+
+export type QueuedPresetSlot = BatchHeroSlot;
+
 
 export interface HeroRosterResult {
   heroes: HeroEntry[];
@@ -151,13 +156,13 @@ export interface RvfxpRecipe {
   mode: 'single' | 'shuffle' | 'procedural' | '12color';
   masterColor: string;
   enemyColor?: string;
-  shufflePalette: string[];
-  preserveIntensity: boolean;
-  ignoreGrayscale: boolean;
-  proceduralJitter: number;
-  brightnessMultiplier: number;
-  opacityValue: number;
-  hueShift: number;
+  shufflePalette?: string[];
+  preserveIntensity?: boolean;
+  ignoreGrayscale?: boolean;
+  proceduralJitter?: number;
+  brightnessMultiplier?: number;
+  opacityValue?: number;
+  hueShift?: number;
 }
 
 export interface RvfxpSlot {
@@ -174,6 +179,7 @@ export interface RvfxpPresetV2 {
   timestamp: string;
   recipe: RvfxpRecipe;
   slots: RvfxpSlot[];
+  manualOverrides?: SessionEntry[];
   savedParameters: SessionEntry[];
 }
 

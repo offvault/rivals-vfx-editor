@@ -158,9 +158,9 @@ export async function getHeroIconDataUrl(heroId: string): Promise<string> {
   return invoke('get_hero_icon_data_url', { heroId });
 }
 
-export async function extractHeroVfx(heroId: string, koMode = false): Promise<HeroVfxResult> {
-  console.debug('[tauri] Extracting hero VFX/KO for:', heroId, 'koMode:', koMode);
-  return invoke('extract_hero_vfx', { heroId, koMode });
+export async function extractHeroVfx(heroId: string, koMode = false, forceRefresh = false): Promise<HeroVfxResult> {
+  console.debug('[tauri] Extracting hero VFX/KO for:', heroId, 'koMode:', koMode, 'forceRefresh:', forceRefresh);
+  return invoke('extract_hero_vfx', { heroId, koMode, forceRefresh });
 }
 
 // ===== Manual Extraction =====

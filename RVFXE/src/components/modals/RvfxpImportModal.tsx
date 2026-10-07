@@ -1,4 +1,6 @@
+import { useMemo } from 'react';
 import type { SessionEntry, RvfxpPresetV2, RvfxpRecipe } from '@/types';
+import { inferRecipeFromLegacySession } from '@/utils/color';
 
 export interface RvfxpImportModalProps {
   filePath: string;
@@ -26,8 +28,12 @@ export function RvfxpImportModal({
   const fileName = filePath.split(/[\\/]/).pop() || 'preset.rvfxp';
   const paramCount = sessionData.length;
   const isHeroMismatch = detectedHeroId && currentLoadedHeroId && detectedHeroId !== currentLoadedHeroId;
-  const isV2 = !!presetV2 && presetV2.version === 2;
-  const recipe = presetV2?.recipe;
+  const isV2 = !!presetV2 && presetV2.version === 2 && !!presetV2.recipe;
+
+  const effectiveRecipe = useMemo(() => {
+    if (presetV2?.recipe) return presetV2.recipe;
+    return inferRecipeFromLegacySession(sessionData);
+  }, [presetV2, sessionData]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
@@ -49,7 +55,7 @@ export function RvfxpImportModal({
                   color: 'var(--text-1)',
                 }}
               >
-                {isV2 ? 'Recipe V2 (Patch-Proof)' : 'Legacy V1'}
+                {isV2 ? 'Recipe V2 (Patch-Proof)' : `Legacy Preset (Auto-Synthesized: ${effectiveRecipe.masterColor})`}
               </span>
             </div>
             <p className="text-xs font-mono mt-0.5 text-gray-300">
@@ -77,36 +83,38 @@ export function RvfxpImportModal({
             </div>
           )}
 
-          {/* Recipe details if V2 */}
-          {recipe && (
+          {/* Recipe details */}
+          {effectiveRecipe && (
             <div className="pt-2 border-t space-y-1.5" style={{ borderColor: 'var(--bg-1)' }}>
               <div className="flex items-center justify-between">
-                <span style={{ color: 'var(--text-3)' }}>Recipe Mode:</span>
+                <span style={{ color: 'var(--text-3)' }}>
+                  {isV2 ? 'Recipe Mode:' : 'Synthesized Mode:'}
+                </span>
                 <span className="font-semibold uppercase tracking-wider text-[var(--accent-main)]">
-                  {recipe.mode}
+                  {effectiveRecipe.mode}
                 </span>
               </div>
               <div className="flex items-center justify-between">
                 <span style={{ color: 'var(--text-3)' }}>Recipe Palette:</span>
                 <div className="flex items-center gap-1.5">
-                  {recipe.masterColor && (
+                  {effectiveRecipe.masterColor && (
                     <div
-                      className="w-4 h-4 border border-gray-600 rounded-none"
-                      style={{ backgroundColor: recipe.masterColor }}
-                      title={`Master: ${recipe.masterColor}`}
+                      className="w-4 h-4 border border-gray-600 rounded-none shadow-sm"
+                      style={{ backgroundColor: effectiveRecipe.masterColor }}
+                      title={`Master: ${effectiveRecipe.masterColor}`}
                     />
                   )}
-                  {recipe.enemyColor && (
+                  {effectiveRecipe.enemyColor && (
                     <div
-                      className="w-4 h-4 border border-gray-600 rounded-none"
-                      style={{ backgroundColor: recipe.enemyColor }}
-                      title={`Enemy Inverted: ${recipe.enemyColor}`}
+                      className="w-4 h-4 border border-gray-600 rounded-none shadow-sm"
+                      style={{ backgroundColor: effectiveRecipe.enemyColor }}
+                      title={`Enemy: ${effectiveRecipe.enemyColor}`}
                     />
                   )}
-                  {recipe.shufflePalette?.map((c, i) => (
+                  {effectiveRecipe.shufflePalette?.map((c, i) => (
                     <div
                       key={i}
-                      className="w-3.5 h-3.5 border border-gray-600 rounded-none"
+                      className="w-3.5 h-3.5 border border-gray-600 rounded-none shadow-sm"
                       style={{ backgroundColor: c }}
                       title={`Palette ${i + 1}: ${c}`}
                     />
@@ -133,7 +141,7 @@ export function RvfxpImportModal({
           {/* Option 1: Patch-Proof Recipe Re-Application */}
           <button
             type="button"
-            onClick={() => onApplyRecipeFresh(recipe)}
+            onClick={() => onApplyRecipeFresh(effectiveRecipe)}
             disabled={!detectedHeroId}
             className="w-full p-3.5 border text-left transition-colors hover:brightness-125 group flex flex-col gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
             style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--accent-main)' }}

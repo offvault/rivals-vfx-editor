@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type {
   ColorParam, RGBA, AppSettings, CacheInfo, ConversionProgress,
   FilterDictionary, SortConfig, UassetSourceMap, FileObject, SessionEntry,
-  UsmapStatus, BatchHeroSlot, RvfxpPresetV2, RvfxpRecipe,
+  UsmapStatus, BatchHeroSlot, RvfxpPresetV2, RvfxpRecipe, QueuedPresetSlot,
 } from '@/types';
 import { useHistory } from '@/hooks/useHistory';
 import { useDebugLog } from '@/hooks/useDebugLog';
@@ -13,6 +13,8 @@ import {
   applyHueShiftToRgba,
   rgbToHsl,
   generateProceduralColors,
+  inferRecipeFromLegacySession,
+  applyRecipeToParams,
 } from '@/utils/color';
 import { setNestedValue, getFileName, normalizePath, pathsMatchSuffix, getPakReadyRelativePath } from '@/utils/helpers';
 import { parseJsonAndExtractColors } from '@/services/colorParser';
@@ -62,6 +64,7 @@ interface HeroSlotWorkspace {
   originalFiles: Record<string, any>;
   uassetSourceMap: UassetSourceMap;
   selectedParams: Set<string>;
+  recipe?: RvfxpRecipe;
 }
 
 export function App() {
@@ -106,6 +109,7 @@ export function App() {
   const [proceduralJitter, setProceduralJitter] = useState(0.35);
   const [brightnessMultiplier, setBrightnessMultiplier] = useState(1.0);
   const [opacityValue, setOpacityValue] = useState(1.0);
+  const [activeRecipeTracker, setActiveRecipeTracker] = useState<Partial<RvfxpRecipe>>({});
 
   // === FOLDER/SORT STATE ===
   const [folders, setFolders] = useState<string[]>([]);
@@ -234,7 +238,74 @@ export function App() {
     });
   }, []);
 
-// === COLOR ACTIONS ===
+  // === RECIPE & EXTRACTION HELPERS ===
+  const compileCurrentRecipe = useCallback((): RvfxpRecipe => {
+    return {
+      mode: (activeRecipeTracker.mode || (isProceduralShuffle ? 'procedural' : shuffleColors.length > 1 ? 'shuffle' : 'single')) as any,
+      masterColor: activeRecipeTracker.masterColor || masterColor,
+      shufflePalette: activeRecipeTracker.shufflePalette || [...shuffleColors],
+      preserveIntensity: activeRecipeTracker.preserveIntensity ?? preserveIntensity,
+      ignoreGrayscale: activeRecipeTracker.ignoreGrayscale ?? ignoreGrayscale,
+      proceduralJitter: activeRecipeTracker.proceduralJitter ?? (isProceduralShuffle ? proceduralJitter : undefined),
+      brightnessMultiplier: activeRecipeTracker.brightnessMultiplier ?? brightnessMultiplier,
+      opacityValue: activeRecipeTracker.opacityValue ?? opacityValue,
+      hueShift: activeRecipeTracker.hueShift ?? hueShiftValue,
+      enemyColor: activeRecipeTracker.enemyColor,
+    };
+  }, [activeRecipeTracker, isProceduralShuffle, shuffleColors, masterColor, preserveIntensity, ignoreGrayscale, proceduralJitter, brightnessMultiplier, opacityValue, hueShiftValue]);
+
+  const fetchHeroVfxData = useCallback(async (
+    heroId: string,
+    koMode: boolean,
+    forceRefresh = false
+  ): Promise<{
+    fileObjs: FileObject[];
+    srcMap: Record<string, { uassetPath: string; jsonPath: string }>;
+    params: ColorParam[];
+    originalFiles: Record<string, any>;
+  }> => {
+    const res = await tauri.extractHeroVfx(heroId, koMode, forceRefresh);
+    const fileObjs: FileObject[] = [];
+    const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
+
+    for (let j = 0; j < res.json_paths.length; j++) {
+      const jsonPath = res.json_paths[j];
+      const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
+      const uassetPath = res.uasset_paths[j] || '';
+      try {
+        const content = await tauri.readTextFile(jsonPath);
+        const parts = jsonPath.replace(/\\/g, '/').split('/');
+        const customIdx = parts.findIndex(p => p === 'Custom');
+        const charsIdx = parts.findIndex(p => p === 'Characters');
+        let relativePath = '';
+        if (customIdx >= 0) {
+          relativePath = parts.slice(customIdx + 1).join('/');
+        } else if (charsIdx >= 0) {
+          const heroIdx = parts.indexOf(heroId, charsIdx + 1);
+          relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
+        } else {
+          const heroIdx = parts.lastIndexOf(heroId);
+          relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
+        }
+        fileObjs.push({ name: fileName, content, relativePath });
+        srcMap[relativePath] = { uassetPath, jsonPath };
+      } catch (e) {}
+    }
+
+    const freshParams: ColorParam[] = [];
+    const freshFiles: Record<string, any> = {};
+    fileObjs.forEach(f => {
+      try {
+        const json = JSON.parse(f.content);
+        freshFiles[f.relativePath] = json;
+        parseJsonAndExtractColors(json, f.name, f.relativePath, freshParams, filterDictionary, debug.addLog);
+      } catch (e) {}
+    });
+
+    return { fileObjs, srcMap, params: freshParams, originalFiles: freshFiles };
+  }, [filterDictionary, debug.addLog]);
+
+  // === COLOR ACTIONS ===
   const handleParamChange = useCallback((id: string, newRgba: RGBA) => {
     const newParams = colorParams.map(p => (p.id === id ? { ...p, rgba: newRgba } : p));
     recordHistory(newParams);
@@ -244,6 +315,14 @@ export function App() {
   const applyMasterColor = useCallback(() => {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
     const newRgba = hexToRgba(masterColor);
+
+    setActiveRecipeTracker(prev => ({
+      ...prev,
+      mode: 'single',
+      masterColor,
+      preserveIntensity,
+      ignoreGrayscale,
+    }));
 
     // Apply to current active slot
     const newParams = colorParams.map(p => {
@@ -262,14 +341,33 @@ export function App() {
           ...p,
           rgba: applyColorToParam(p.rgba, newRgba, { preserveIntensity, ignoreGrayscale }),
         }));
-        return { ...s, colorParams: updated };
+        return {
+          ...s,
+          colorParams: updated,
+          recipe: {
+            mode: 'single',
+            masterColor,
+            preserveIntensity,
+            ignoreGrayscale,
+            brightnessMultiplier,
+            opacityValue,
+            hueShift: hueShiftValue,
+          },
+        };
       }));
       debug.addLog(`✓ Synced single color across all ${batchSlots.length} slots`);
     }
-  }, [selectedParams, masterColor, colorParams, recordHistory, preserveIntensity, ignoreGrayscale, isBatchMode, applyToAllBatch, batchSlots.length, activeSlotId, debug]);
+  }, [selectedParams, masterColor, colorParams, recordHistory, preserveIntensity, ignoreGrayscale, isBatchMode, applyToAllBatch, batchSlots.length, activeSlotId, debug, brightnessMultiplier, opacityValue, hueShiftValue]);
 
   const applyHueShift = useCallback(() => {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
+
+    setActiveRecipeTracker(prev => ({
+      ...prev,
+      hueShift: (prev.hueShift || 0) + hueShiftValue,
+      ignoreGrayscale,
+    }));
+
     const newParams = colorParams.map(p => {
       if (selectedParams.has(p.id)) return { ...p, rgba: applyHueShiftToRgba(p.rgba, hueShiftValue, ignoreGrayscale) };
       return p;
@@ -284,7 +382,11 @@ export function App() {
           ...p,
           rgba: applyHueShiftToRgba(p.rgba, hueShiftValue, ignoreGrayscale),
         }));
-        return { ...s, colorParams: updated };
+        return {
+          ...s,
+          colorParams: updated,
+          recipe: s.recipe ? { ...s.recipe, hueShift: (s.recipe.hueShift || 0) + hueShiftValue } : undefined,
+        };
       }));
       debug.addLog(`✓ Synced hue shift across all ${batchSlots.length} slots`);
     }
@@ -292,6 +394,16 @@ export function App() {
 
   const applyShuffle = useCallback(() => {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
+
+    setActiveRecipeTracker(prev => ({
+      ...prev,
+      mode: isProceduralShuffle ? 'procedural' : 'shuffle',
+      shufflePalette: [...shuffleColors],
+      proceduralJitter: isProceduralShuffle ? proceduralJitter : undefined,
+      preserveIntensity,
+      ignoreGrayscale,
+    }));
+
     if (isProceduralShuffle) {
       const selectedList = colorParams.filter(p => selectedParams.has(p.id));
       const generatedColors = generateProceduralColors(shuffleColors, selectedList.length, proceduralJitter);
@@ -334,6 +446,12 @@ export function App() {
 
   const applyBrightnessMultiplier = useCallback(() => {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
+
+    setActiveRecipeTracker(prev => ({
+      ...prev,
+      brightnessMultiplier: (prev.brightnessMultiplier || 1.0) * brightnessMultiplier,
+    }));
+
     const newParams = colorParams.map(p => {
       if (selectedParams.has(p.id)) {
         return {
@@ -354,6 +472,12 @@ export function App() {
 
   const applyOpacity = useCallback(() => {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
+
+    setActiveRecipeTracker(prev => ({
+      ...prev,
+      opacityValue,
+    }));
+
     const newParams = colorParams.map(p => {
       if (selectedParams.has(p.id)) {
         return {
@@ -504,6 +628,8 @@ export function App() {
   const handleSwitchSlot = useCallback((targetSlotId: string) => {
     if (targetSlotId === activeSlotId) return;
 
+    const currentRecipe = compileCurrentRecipe();
+
     // 1. Commit active edits into batchSlots
     setBatchSlots(prev => prev.map(s => {
       if (s.slotId === activeSlotId) {
@@ -514,6 +640,7 @@ export function App() {
           uassetSourceMap: { ...uassetSourceMap },
           selectedParams: new Set(selectedParams),
           customLabel: sessionName,
+          recipe: currentRecipe,
         };
       }
       return s;
@@ -532,16 +659,29 @@ export function App() {
     setInitialHistory(target.colorParams);
     setSelectedParams(new Set(target.selectedParams));
 
+    if (target.recipe) {
+      setActiveRecipeTracker(target.recipe);
+      if (target.recipe.masterColor) setMasterColor(target.recipe.masterColor);
+      if (target.recipe.shufflePalette) setShuffleColors([...target.recipe.shufflePalette]);
+      if (target.recipe.mode === 'procedural') setIsProceduralShuffle(true);
+      else if (target.recipe.mode === 'shuffle') setIsProceduralShuffle(false);
+      if (target.recipe.preserveIntensity !== undefined) setPreserveIntensity(target.recipe.preserveIntensity);
+      if (target.recipe.ignoreGrayscale !== undefined) setIgnoreGrayscale(target.recipe.ignoreGrayscale);
+      if (target.recipe.proceduralJitter !== undefined) setProceduralJitter(target.recipe.proceduralJitter);
+    } else {
+      setActiveRecipeTracker({});
+    }
+
     const uniqueFolders = [...new Set(target.colorParams.map(p => {
       const lastSlash = p.relativePath.lastIndexOf('/');
       return lastSlash > 0 ? p.relativePath.substring(0, lastSlash) : '/';
     }))];
     setFolders(uniqueFolders.sort());
     setSelectedFolders(new Set(uniqueFolders));
-  }, [activeSlotId, batchSlots, colorParams, originalFiles, uassetSourceMap, selectedParams, sessionName, setInitialHistory]);
+  }, [activeSlotId, batchSlots, colorParams, originalFiles, uassetSourceMap, selectedParams, sessionName, setInitialHistory, compileCurrentRecipe]);
 
   // === UP-FRONT BATCH EXTRACTION (RUNS ONCE FOR ALL QUEUED HEROES) ===
-  const handleBatchLoadHeroes = useCallback(async (slots: BatchHeroSlot[], koMode: boolean) => {
+  const handleBatchLoadHeroes = useCallback(async (slots: QueuedPresetSlot[], koMode: boolean, forceRefresh = false) => {
     setShowHeroBrowser(false);
     setIsConverting(true);
     setIsBatchMode(true);
@@ -552,7 +692,12 @@ export function App() {
       const uniqueHeroIds = [...new Set(slots.map(s => s.heroId))];
       debug.addLog(`Beginning up-front extraction for ${uniqueHeroIds.length} heroes across ${slots.length} slots...`);
 
-      const rawExtractedMap: Record<string, { fileObjs: FileObject[]; srcMap: Record<string, { uassetPath: string; jsonPath: string }> }> = {};
+      const rawExtractedMap: Record<string, {
+        fileObjs: FileObject[];
+        srcMap: Record<string, { uassetPath: string; jsonPath: string }>;
+        params: ColorParam[];
+        originalFiles: Record<string, any>;
+      }> = {};
 
       for (let i = 0; i < uniqueHeroIds.length; i++) {
         const hId = uniqueHeroIds[i];
@@ -562,33 +707,8 @@ export function App() {
           fileName: `Extracting & converting Hero ${hId} [${i + 1}/${uniqueHeroIds.length}]...`,
         });
 
-        const res = await tauri.extractHeroVfx(hId, koMode);
-        const fileObjs: FileObject[] = [];
-        const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
-
-        for (let j = 0; j < res.json_paths.length; j++) {
-          const jsonPath = res.json_paths[j];
-          const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
-          const uassetPath = res.uasset_paths[j] || '';
-          try {
-            const content = await tauri.readTextFile(jsonPath);
-            const parts = jsonPath.replace(/\\/g, '/').split('/');
-            const customIdx = parts.findIndex(p => p === 'Custom');
-            const charsIdx = parts.findIndex(p => p === 'Characters');
-            let relativePath = '';
-            if (customIdx >= 0) relativePath = parts.slice(customIdx + 1).join('/');
-            else if (charsIdx >= 0) {
-              const heroIdx = parts.indexOf(hId, charsIdx + 1);
-              relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${hId}/${fileName}`;
-            } else {
-              const heroIdx = parts.lastIndexOf(hId);
-              relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${hId}/${fileName}`;
-            }
-            fileObjs.push({ name: fileName, content, relativePath });
-            srcMap[relativePath] = { uassetPath, jsonPath };
-          } catch (e) {}
-        }
-        rawExtractedMap[hId] = { fileObjs, srcMap };
+        const data = await fetchHeroVfxData(hId, koMode, forceRefresh);
+        rawExtractedMap[hId] = data;
       }
 
       // Initialize each slot with its own isolated memory copy
@@ -597,16 +717,39 @@ export function App() {
         const raw = rawExtractedMap[slot.heroId];
         if (!raw) continue;
 
-        const slotParams: ColorParam[] = [];
-        const slotOriginalFiles: Record<string, any> = {};
+        // Deep-clone raw params and originalFiles for complete memory isolation
+        const slotParams: ColorParam[] = structuredClone(raw.params);
+        const slotOriginalFiles: Record<string, any> = structuredClone(raw.originalFiles);
 
-        raw.fileObjs.forEach(fileObj => {
-          try {
-            const json = JSON.parse(fileObj.content);
-            slotOriginalFiles[fileObj.relativePath] = json;
-            parseJsonAndExtractColors(json, fileObj.name, fileObj.relativePath, slotParams, filterDictionary, () => {});
-          } catch (e) {}
-        });
+        // Determine effective recipe
+        let effectiveRecipe: RvfxpRecipe | undefined = slot.recipe;
+        if (!effectiveRecipe && slot.sessionData && slot.sessionData.length > 0) {
+          effectiveRecipe = inferRecipeFromLegacySession(slot.sessionData);
+        }
+
+        // Apply recipe math if present
+        if (effectiveRecipe) {
+          applyRecipeToParams(slotParams, effectiveRecipe);
+        }
+
+        // Apply explicit sessionData overrides if provided
+        if (slot.sessionData && slot.sessionData.length > 0) {
+          for (const param of slotParams) {
+            const paramNorm = normalizePath(param.relativePath);
+            const paramFileName = getFileName(param.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, '');
+            let match = slot.sessionData.find(e => normalizePath(e.relativePath) === paramNorm && e.paramName === param.paramName);
+            if (!match) match = slot.sessionData.find(e => pathsMatchSuffix(normalizePath(e.relativePath), paramNorm) && e.paramName === param.paramName);
+            if (!match) match = slot.sessionData.find(e => getFileName(e.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, '') === paramFileName && e.paramName === param.paramName);
+            if (match?.rgba) {
+              param.rgba = {
+                R: match.rgba.R ?? param.rgba.R,
+                G: match.rgba.G ?? param.rgba.G,
+                B: match.rgba.B ?? param.rgba.B,
+                A: match.rgba.A ?? param.rgba.A,
+              };
+            }
+          }
+        }
 
         const cleanLabel = slot.customLabel.replace(/\s+/g, '_') + (slot.customLabel.toLowerCase().includes('vfx') ? '' : '_VFX');
 
@@ -621,6 +764,7 @@ export function App() {
           originalFiles: slotOriginalFiles,
           uassetSourceMap: { ...raw.srcMap },
           selectedParams: new Set(slotParams.map(p => p.id)),
+          recipe: effectiveRecipe,
         });
       }
 
@@ -638,6 +782,19 @@ export function App() {
         setInitialHistory(first.colorParams);
         setSelectedParams(new Set(first.selectedParams));
 
+        if (first.recipe) {
+          setActiveRecipeTracker(first.recipe);
+          if (first.recipe.masterColor) setMasterColor(first.recipe.masterColor);
+          if (first.recipe.shufflePalette) setShuffleColors([...first.recipe.shufflePalette]);
+          if (first.recipe.mode === 'procedural') setIsProceduralShuffle(true);
+          else if (first.recipe.mode === 'shuffle') setIsProceduralShuffle(false);
+          if (first.recipe.preserveIntensity !== undefined) setPreserveIntensity(first.recipe.preserveIntensity);
+          if (first.recipe.ignoreGrayscale !== undefined) setIgnoreGrayscale(first.recipe.ignoreGrayscale);
+          if (first.recipe.proceduralJitter !== undefined) setProceduralJitter(first.recipe.proceduralJitter);
+        } else {
+          setActiveRecipeTracker({});
+        }
+
         const uniqueFolders = [...new Set(first.colorParams.map(p => {
           const lastSlash = p.relativePath.lastIndexOf('/');
           return lastSlash > 0 ? p.relativePath.substring(0, lastSlash) : '/';
@@ -646,17 +803,17 @@ export function App() {
         setSelectedFolders(new Set(uniqueFolders));
       }
 
-      debug.addLog(`✓ Batch ready! All ${preparedSlots.length} slots loaded into memory.`);
+      debug.addLog(`✓ Batch ready! All ${preparedSlots.length} slots loaded into memory with individual recolors applied.`);
     } catch (err: any) {
       alert(`Batch preparation error: ${err.message || err}`);
     } finally {
       setIsConverting(false);
       setConversionProgress({ current: 0, total: 0, fileName: '' });
     }
-  }, [debug, filterDictionary, setInitialHistory]);
+  }, [debug, fetchHeroVfxData, setInitialHistory]);
 
   // === SINGLE HERO SELECT (NON-BATCH) ===
-  const handleHeroSelect = useCallback(async (heroId: string, heroName: string, koMode = false) => {
+  const handleHeroSelect = useCallback(async (heroId: string, heroName: string, koMode = false, forceRefresh = false) => {
     setShowHeroBrowser(false);
     setIsConverting(true);
     setIsBatchMode(false);
@@ -668,65 +825,30 @@ export function App() {
     setIsKoModeActive(koMode);
 
     try {
-      const res = await tauri.extractHeroVfx(heroId, koMode);
-      const fileObjs: FileObject[] = [];
-      const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
-
-      for (let j = 0; j < res.json_paths.length; j++) {
-        const jsonPath = res.json_paths[j];
-        const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
-        const uassetPath = res.uasset_paths[j] || '';
-        try {
-          const content = await tauri.readTextFile(jsonPath);
-          const parts = jsonPath.replace(/\\/g, '/').split('/');
-          const customIdx = parts.findIndex(p => p === 'Custom');
-          const charsIdx = parts.findIndex(p => p === 'Characters');
-          let relativePath = '';
-          if (customIdx >= 0) relativePath = parts.slice(customIdx + 1).join('/');
-          else if (charsIdx >= 0) {
-            const heroIdx = parts.indexOf(heroId, charsIdx + 1);
-            relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
-          } else {
-            const heroIdx = parts.lastIndexOf(heroId);
-            relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
-          }
-          fileObjs.push({ name: fileName, content, relativePath });
-          srcMap[relativePath] = { uassetPath, jsonPath };
-        } catch (e) {}
-      }
-
-      const freshParams: ColorParam[] = [];
-      const freshFiles: Record<string, any> = {};
-      fileObjs.forEach(f => {
-        try {
-          const json = JSON.parse(f.content);
-          freshFiles[f.relativePath] = json;
-          parseJsonAndExtractColors(json, f.name, f.relativePath, freshParams, filterDictionary, debug.addLog);
-        } catch (e) {}
-      });
-
+      const data = await fetchHeroVfxData(heroId, koMode, forceRefresh);
       const cleanName = koMode ? `${heroName.replace(/\s+/g, '_')}_KO` : `${heroName.replace(/\s+/g, '_')}_VFX`;
       setSessionName(cleanName);
-      setOriginalFiles(freshFiles);
-      setUassetSourceMap(srcMap);
-      setInitialHistory(freshParams);
-      setSelectedParams(new Set(freshParams.map(p => p.id)));
+      setOriginalFiles(data.originalFiles);
+      setUassetSourceMap(data.srcMap);
+      setInitialHistory(data.params);
+      setSelectedParams(new Set(data.params.map(p => p.id)));
+      setActiveRecipeTracker({});
 
-      const uniqueFolders = [...new Set(freshParams.map(p => {
+      const uniqueFolders = [...new Set(data.params.map(p => {
         const lastSlash = p.relativePath.lastIndexOf('/');
         return lastSlash > 0 ? p.relativePath.substring(0, lastSlash) : '/';
       }))];
       setFolders(uniqueFolders.sort());
       setSelectedFolders(new Set(uniqueFolders));
 
-      debug.addLog(`Loaded ${freshParams.length} parameters for ${heroName}`);
+      debug.addLog(`Loaded ${data.params.length} parameters for ${heroName}`);
     } catch (err: any) {
-      alert(`Failed to load ${heroName}: ${err}`);
+      alert(`Failed to load ${heroName}: ${err.message || err}`);
     } finally {
       setIsConverting(false);
       setConversionProgress({ current: 0, total: 0, fileName: '' });
     }
-  }, [debug, filterDictionary, setInitialHistory]);
+  }, [debug, fetchHeroVfxData, setInitialHistory]);
 
   // === SAVE SINGLE & BATCH MOD EXPORT HANDLERS ===
   const handleTriggerSave = useCallback(() => {
@@ -790,6 +912,7 @@ export function App() {
         }
 
         // Write Version 2 .rvfxp preset
+        const currentRecipe = compileCurrentRecipe();
         const sessionData: SessionEntry[] = colorParams.map(p => ({
           relativePath: p.relativePath.replace(/\.json$/i, ''),
           paramName: p.paramName,
@@ -799,17 +922,7 @@ export function App() {
           version: 2,
           generator: 'RivalsVFXEditor',
           timestamp: new Date().toISOString(),
-          recipe: {
-            mode: isProceduralShuffle ? 'procedural' : shuffleColors.length > 1 ? 'shuffle' : 'single',
-            masterColor,
-            shufflePalette: [...shuffleColors],
-            preserveIntensity,
-            ignoreGrayscale,
-            proceduralJitter,
-            brightnessMultiplier,
-            opacityValue,
-            hueShift: hueShiftValue,
-          },
+          recipe: currentRecipe,
           slots: [
             {
               slotId: activeSlotId || 'slot_active',
@@ -842,6 +955,7 @@ export function App() {
         // ===== BATCH SAVE ALL SLOTS =====
         const totalSlots = batchSlots.length;
         const allContainerFiles: string[] = [];
+        const currentRecipe = compileCurrentRecipe();
 
         for (let sIdx = 0; sIdx < totalSlots; sIdx++) {
           const slot = batchSlots[sIdx];
@@ -877,7 +991,8 @@ export function App() {
             }
           }
 
-          // Auto-write .rvfxp preset V2 for this slot
+          // Auto-write .rvfxp preset V2 for this slot using its isolated recipe
+          const slotRecipe = (slot.slotId === activeSlotId ? currentRecipe : slot.recipe) || currentRecipe;
           const slotSessionData: SessionEntry[] = slot.colorParams.map(p => ({
             relativePath: p.relativePath.replace(/\.json$/i, ''),
             paramName: p.paramName,
@@ -887,17 +1002,7 @@ export function App() {
             version: 2,
             generator: 'RivalsVFXEditor',
             timestamp: new Date().toISOString(),
-            recipe: {
-              mode: isProceduralShuffle ? 'procedural' : shuffleColors.length > 1 ? 'shuffle' : 'single',
-              masterColor,
-              shufflePalette: [...shuffleColors],
-              preserveIntensity,
-              ignoreGrayscale,
-              proceduralJitter,
-              brightnessMultiplier,
-              opacityValue,
-              hueShift: hueShiftValue,
-            },
+            recipe: slotRecipe,
             slots: [
               {
                 slotId: slot.slotId,
@@ -956,74 +1061,21 @@ export function App() {
     }
   }, [
     saveModalIsBatch, sessionName, uassetSourceMap, originalFiles, colorParams,
-    activeSlotId, currentHeroId, currentHeroName, isProceduralShuffle, shuffleColors,
-    preserveIntensity, ignoreGrayscale, proceduralJitter, brightnessMultiplier,
-    opacityValue, hueShiftValue, masterColor, batchSlots, debug,
+    activeSlotId, currentHeroId, currentHeroName, batchSlots, debug, compileCurrentRecipe,
   ]);
 
   const applyRecipeToCurrentParams = useCallback((recipe: RvfxpRecipe) => {
     debug.addLog(`Applying recipe (${recipe.mode}) to current parameters...`);
-    const masterRgba = hexToRgba(recipe.masterColor);
-    const enemyRgba = recipe.enemyColor ? hexToRgba(recipe.enemyColor) : null;
-
-    let newParams = colorParams.map(param => {
-      const isEnemy = /enemy/i.test(param.paramName) || /enemy/i.test(param.relativePath);
-      let targetRgba = masterRgba;
-      if (isEnemy && enemyRgba) {
-        targetRgba = enemyRgba;
-      }
-      let resRgba = applyColorToParam(param.rgba, targetRgba, {
-        preserveIntensity: recipe.preserveIntensity,
-        ignoreGrayscale: recipe.ignoreGrayscale,
-      });
-      if (recipe.brightnessMultiplier !== 1.0) {
-        resRgba = {
-          ...resRgba,
-          R: Math.min(100, Math.max(0, resRgba.R * recipe.brightnessMultiplier)),
-          G: Math.min(100, Math.max(0, resRgba.G * recipe.brightnessMultiplier)),
-          B: Math.min(100, Math.max(0, resRgba.B * recipe.brightnessMultiplier)),
-        };
-      }
-      if (recipe.opacityValue !== 1.0) {
-        resRgba = { ...resRgba, A: recipe.opacityValue };
-      }
-      return { ...param, rgba: resRgba };
-    });
-
-    if (recipe.mode === 'shuffle' && recipe.shufflePalette && recipe.shufflePalette.length > 0) {
-      const palette = recipe.shufflePalette;
-      newParams = newParams.map((p, idx) => {
-        const hex = palette[idx % palette.length];
-        return {
-          ...p,
-          rgba: applyColorToParam(p.rgba, hexToRgba(hex), {
-            preserveIntensity: recipe.preserveIntensity,
-            ignoreGrayscale: recipe.ignoreGrayscale,
-          }),
-        };
-      });
-    } else if (recipe.mode === 'procedural' && recipe.shufflePalette && recipe.shufflePalette.length > 0) {
-      const generatedColors = generateProceduralColors(recipe.shufflePalette, newParams.length, recipe.proceduralJitter || 0.35);
-      newParams = newParams.map((p, idx) => {
-        const hex = generatedColors[idx];
-        return {
-          ...p,
-          rgba: applyColorToParam(p.rgba, hexToRgba(hex), {
-            preserveIntensity: recipe.preserveIntensity,
-            ignoreGrayscale: recipe.ignoreGrayscale,
-          }),
-        };
-      });
-    }
-
-    if (recipe.hueShift) {
-      newParams = newParams.map(p => ({
-        ...p,
-        rgba: applyHueShiftToRgba(p.rgba, recipe.hueShift, recipe.ignoreGrayscale),
-      }));
-    }
-
+    const newParams = applyRecipeToParams(structuredClone(colorParams), recipe);
     recordHistory(newParams);
+    setActiveRecipeTracker(recipe);
+    if (recipe.masterColor) setMasterColor(recipe.masterColor);
+    if (recipe.shufflePalette) setShuffleColors([...recipe.shufflePalette]);
+    if (recipe.mode === 'procedural') setIsProceduralShuffle(true);
+    else if (recipe.mode === 'shuffle') setIsProceduralShuffle(false);
+    if (recipe.preserveIntensity !== undefined) setPreserveIntensity(recipe.preserveIntensity);
+    if (recipe.ignoreGrayscale !== undefined) setIgnoreGrayscale(recipe.ignoreGrayscale);
+    if (recipe.proceduralJitter !== undefined) setProceduralJitter(recipe.proceduralJitter);
     debug.addLog(`✓ Applied recipe math across ${newParams.length} parameters!`);
     alert(`Recipe applied successfully across all ${newParams.length} parameters!`);
   }, [colorParams, recordHistory, debug]);
@@ -1031,13 +1083,68 @@ export function App() {
   // === SMART RVFXP IMPORT FLOW ===
   const handleImportSession = useCallback(async () => {
     try {
-      const filePath = await tauri.openDialog({
+      const filePaths = await tauri.openDialog({
         title: 'Import Project Preset (.rvfxp)',
-        multiple: false,
+        multiple: true,
         filters: [{ name: 'RVFX Project', extensions: ['rvfxp', 'json'] }],
       });
-      if (!filePath) return;
-      const content = await tauri.readTextFile(filePath as string);
+      if (!filePaths) return;
+      const paths = Array.isArray(filePaths) ? filePaths : [filePaths as string];
+      if (paths.length === 0) return;
+
+      if (paths.length > 1) {
+        debug.addLog(`Queueing ${paths.length} presets into batch slots...`);
+        const queuedSlots: QueuedPresetSlot[] = [];
+        const roster = await tauri.getHeroRoster(false).catch(() => ({ heroes: [] }));
+        for (let i = 0; i < paths.length; i++) {
+          try {
+            const fp = paths[i];
+            const content = await tauri.readTextFile(fp);
+            const parsed = JSON.parse(content);
+            let hId = '1011';
+            let customLabel = fp.split(/[\\/]/).pop()?.replace(/\.rvfxp$/i, '') || `Mod_${i + 1}`;
+            let parsedRecipe: RvfxpRecipe | undefined;
+            let parsedSessionData: SessionEntry[] = [];
+
+            if (parsed && parsed.version === 2) {
+              const p2 = parsed as RvfxpPresetV2;
+              parsedRecipe = p2.recipe;
+              parsedSessionData = p2.savedParameters || [];
+              if (p2.slots?.[0]) {
+                hId = p2.slots[0].heroId;
+                customLabel = p2.slots[0].customLabel || customLabel;
+              }
+            } else if (Array.isArray(parsed)) {
+              parsedSessionData = parsed as SessionEntry[];
+              for (const entry of parsedSessionData) {
+                const m = entry.relativePath.match(/(?:Characters|Custom)[\\/](\d{4})/i) || entry.relativePath.match(/^(\d{4})[\\/]/);
+                if (m) { hId = m[1]; break; }
+              }
+              parsedRecipe = inferRecipeFromLegacySession(parsedSessionData);
+            }
+
+            const hName = roster.heroes.find(h => h.hero_id === hId)?.display_name || `Hero ${hId}`;
+            queuedSlots.push({
+              slotId: `slot_${Date.now()}_${i}`,
+              heroId: hId,
+              heroName: hName,
+              customLabel,
+              recipe: parsedRecipe,
+              sessionData: parsedSessionData,
+            });
+          } catch (e: any) {
+            debug.addLog(`Error parsing preset ${paths[i]}: ${e.message || e}`);
+          }
+        }
+        if (queuedSlots.length > 0) {
+          await handleBatchLoadHeroes(queuedSlots, false);
+        }
+        return;
+      }
+
+      // Single file import flow
+      const filePath = paths[0];
+      const content = await tauri.readTextFile(filePath);
       const parsed = JSON.parse(content);
       let sessionData: SessionEntry[] = [];
       let presetV2: RvfxpPresetV2 | null = null;
@@ -1071,7 +1178,7 @@ export function App() {
       }
 
       setPendingRvfxp({
-        filePath: filePath as string,
+        filePath,
         presetV2,
         sessionData,
         detectedHeroId,
@@ -1081,7 +1188,7 @@ export function App() {
     } catch (err: any) {
       alert(`Failed to import session: ${err.message || err}`);
     }
-  }, []);
+  }, [debug, handleBatchLoadHeroes]);
 
   const applyRvfxpToLoadedParams = useCallback((sessionData: SessionEntry[]) => {
     let updatedCount = 0;
@@ -1119,52 +1226,96 @@ export function App() {
 
   const handleApplyRecipeFresh = useCallback(async (recipeToApply?: RvfxpRecipe) => {
     if (!pendingRvfxp) return;
-    const targetRecipe = recipeToApply || pendingRvfxp.presetV2?.recipe;
-    const targetHeroId = pendingRvfxp.detectedHeroId;
+    const targetRecipe = recipeToApply || pendingRvfxp.presetV2?.recipe || (pendingRvfxp.sessionData.length > 0 ? inferRecipeFromLegacySession(pendingRvfxp.sessionData) : undefined);
+    const targetHeroId = pendingRvfxp.detectedHeroId || currentHeroId;
+    if (!targetHeroId) {
+      alert('Could not determine hero for this preset.');
+      return;
+    }
     const targetHeroName = pendingRvfxp.detectedHeroName || targetHeroId || 'Hero';
 
     setShowRvfxpImport(false);
+    setIsConverting(true);
 
-    if (targetHeroId && targetHeroId !== currentHeroId) {
-      debug.addLog(`Re-extracting fresh files for hero ${targetHeroId} to apply recipe...`);
-      await handleHeroSelect(targetHeroId, targetHeroName, false);
-    }
+    try {
+      debug.addLog(`Extracting fresh vanilla files (forceRefresh=true) for hero ${targetHeroId} to apply recipe...`);
+      const data = await fetchHeroVfxData(targetHeroId, false, true);
 
-    setTimeout(() => {
       if (targetRecipe) {
-        applyRecipeToCurrentParams(targetRecipe);
-      } else {
-        applyRvfxpToLoadedParams(pendingRvfxp.sessionData);
+        applyRecipeToParams(data.params, targetRecipe);
+        setActiveRecipeTracker(targetRecipe);
+        if (targetRecipe.masterColor) setMasterColor(targetRecipe.masterColor);
+        if (targetRecipe.shufflePalette) setShuffleColors([...targetRecipe.shufflePalette]);
+        if (targetRecipe.mode === 'procedural') setIsProceduralShuffle(true);
+        else if (targetRecipe.mode === 'shuffle') setIsProceduralShuffle(false);
+        if (targetRecipe.preserveIntensity !== undefined) setPreserveIntensity(targetRecipe.preserveIntensity);
+        if (targetRecipe.ignoreGrayscale !== undefined) setIgnoreGrayscale(targetRecipe.ignoreGrayscale);
+        if (targetRecipe.proceduralJitter !== undefined) setProceduralJitter(targetRecipe.proceduralJitter);
       }
+
+      // If manualOverrides or explicit sessionData exist, apply any matching manual parameter tweaks on top
+      const overrides = pendingRvfxp.presetV2?.manualOverrides || (!targetRecipe ? pendingRvfxp.sessionData : []);
+      if (overrides.length > 0) {
+        for (const param of data.params) {
+          const paramNorm = normalizePath(param.relativePath);
+          const paramFileName = getFileName(param.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, '');
+          let match = overrides.find(e => normalizePath(e.relativePath) === paramNorm && e.paramName === param.paramName);
+          if (!match) match = overrides.find(e => pathsMatchSuffix(normalizePath(e.relativePath), paramNorm) && e.paramName === param.paramName);
+          if (!match) match = overrides.find(e => getFileName(e.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, '') === paramFileName && e.paramName === param.paramName);
+          if (match?.rgba) {
+            param.rgba = {
+              R: match.rgba.R ?? param.rgba.R,
+              G: match.rgba.G ?? param.rgba.G,
+              B: match.rgba.B ?? param.rgba.B,
+              A: match.rgba.A ?? param.rgba.A,
+            };
+          }
+        }
+      }
+
+      const cleanName = `${targetHeroName.replace(/\s+/g, '_')}_VFX`;
+      setSessionName(cleanName);
+      setCurrentHeroId(targetHeroId);
+      setCurrentHeroName(targetHeroName);
+      setOriginalFiles(data.originalFiles);
+      setUassetSourceMap(data.srcMap);
+      setInitialHistory(data.params);
+      setSelectedParams(new Set(data.params.map(p => p.id)));
+
+      const uniqueFolders = [...new Set(data.params.map(p => {
+        const lastSlash = p.relativePath.lastIndexOf('/');
+        return lastSlash > 0 ? p.relativePath.substring(0, lastSlash) : '/';
+      }))];
+      setFolders(uniqueFolders.sort());
+      setSelectedFolders(new Set(uniqueFolders));
+
       setPendingRvfxp(null);
-    }, 400);
-  }, [pendingRvfxp, currentHeroId, debug, handleHeroSelect, applyRecipeToCurrentParams, applyRvfxpToLoadedParams]);
+      debug.addLog(`✓ Fresh recipe applied to ${data.params.length} parameters for ${targetHeroName}!`);
+      alert(`Recipe applied successfully across ${data.params.length} fresh ${targetHeroName} assets!`);
+    } catch (err: any) {
+      alert(`Failed to apply fresh recipe: ${err.message || err}`);
+    } finally {
+      setIsConverting(false);
+      setConversionProgress({ current: 0, total: 0, fileName: '' });
+    }
+  }, [pendingRvfxp, currentHeroId, debug, fetchHeroVfxData, setInitialHistory]);
 
   // === EXPORT CURRENT SESSION FILE (VERSION 2 RECIPE PRESET) ===
   const handleExportSession = useCallback(async () => {
-    if (selectedParams.size === 0) { alert('No parameters selected to export.'); return; }
+    if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
     const sessionData: SessionEntry[] = colorParams.filter(p => selectedParams.has(p.id)).map(p => ({
       relativePath: p.relativePath.replace(/\.json$/i, ''),
       paramName: p.paramName,
       rgba: p.rgba,
     }));
 
+    const currentRecipe = compileCurrentRecipe();
     const cleanMod = sessionName.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
     const presetV2: RvfxpPresetV2 = {
       version: 2,
       generator: 'RivalsVFXEditor',
       timestamp: new Date().toISOString(),
-      recipe: {
-        mode: isProceduralShuffle ? 'procedural' : shuffleColors.length > 1 ? 'shuffle' : 'single',
-        masterColor,
-        shufflePalette: [...shuffleColors],
-        preserveIntensity,
-        ignoreGrayscale,
-        proceduralJitter,
-        brightnessMultiplier,
-        opacityValue,
-        hueShift: hueShiftValue,
-      },
+      recipe: currentRecipe,
       slots: [
         {
           slotId: activeSlotId || 'slot_active',
@@ -1190,10 +1341,7 @@ export function App() {
       alert(`Failed to export session: ${err.message || err}`);
     }
   }, [
-    selectedParams, colorParams, sessionName, isProceduralShuffle, shuffleColors,
-    masterColor, preserveIntensity, ignoreGrayscale, proceduralJitter,
-    brightnessMultiplier, opacityValue, hueShiftValue, activeSlotId,
-    currentHeroId, currentHeroName,
+    selectedParams, colorParams, sessionName, activeSlotId, currentHeroId, currentHeroName, compileCurrentRecipe,
   ]);
 
   // === FULL RESET ===
@@ -1219,6 +1367,7 @@ export function App() {
     setShowGrayscale(true);
     setOpacityValue(1.0);
     setUassetSourceMap({});
+    setActiveRecipeTracker({});
   }, [resetHistory]);
 
   // === GLOBAL FILE DROP HANDLING ===
@@ -1287,7 +1436,7 @@ export function App() {
 
     if (rvfxpFiles.length > 1) {
       debug.addLog(`Queueing ${rvfxpFiles.length} presets into batch slots...`);
-      const queuedSlots: BatchHeroSlot[] = [];
+      const queuedSlots: QueuedPresetSlot[] = [];
       const roster = await tauri.getHeroRoster(false).catch(() => ({ heroes: [] }));
       for (let i = 0; i < rvfxpFiles.length; i++) {
         try {
@@ -1296,23 +1445,38 @@ export function App() {
           const parsed = JSON.parse(content);
           let hId = '1011';
           let customLabel = fp.split(/[\\/]/).pop()?.replace(/\.rvfxp$/i, '') || `Mod_${i + 1}`;
-          if (parsed && parsed.version === 2 && parsed.slots?.[0]) {
-            hId = parsed.slots[0].heroId;
-            customLabel = parsed.slots[0].customLabel || customLabel;
+          let parsedRecipe: RvfxpRecipe | undefined;
+          let parsedSessionData: SessionEntry[] = [];
+
+          if (parsed && parsed.version === 2) {
+            const p2 = parsed as RvfxpPresetV2;
+            parsedRecipe = p2.recipe;
+            parsedSessionData = p2.savedParameters || [];
+            if (p2.slots?.[0]) {
+              hId = p2.slots[0].heroId;
+              customLabel = p2.slots[0].customLabel || customLabel;
+            }
           } else if (Array.isArray(parsed)) {
-            for (const entry of parsed) {
+            parsedSessionData = parsed as SessionEntry[];
+            for (const entry of parsedSessionData) {
               const m = entry.relativePath.match(/(?:Characters|Custom)[\\/](\d{4})/i) || entry.relativePath.match(/^(\d{4})[\\/]/);
               if (m) { hId = m[1]; break; }
             }
+            parsedRecipe = inferRecipeFromLegacySession(parsedSessionData);
           }
+
           const hName = roster.heroes.find(h => h.hero_id === hId)?.display_name || `Hero ${hId}`;
           queuedSlots.push({
             slotId: `slot_${Date.now()}_${i}`,
             heroId: hId,
             heroName: hName,
             customLabel,
+            recipe: parsedRecipe,
+            sessionData: parsedSessionData,
           });
-        } catch (e) {}
+        } catch (e: any) {
+          debug.addLog(`Error parsing preset ${rvfxpFiles[i]}: ${e.message || e}`);
+        }
       }
       if (queuedSlots.length > 0) {
         await handleBatchLoadHeroes(queuedSlots, false);

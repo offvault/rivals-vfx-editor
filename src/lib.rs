@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 #[cfg(target_os = "windows")]
+#[allow(unused_imports)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -2295,13 +2296,25 @@ async fn extract_hero_vfx(
     state: State<'_, AppState>,
     hero_id: String,
     ko_mode: Option<bool>,
+    force_refresh: Option<bool>,
 ) -> Result<HeroVfxResult, String> {
     let is_ko = ko_mode.unwrap_or(false);
-    eprintln!("[DEBUG] extract_hero_vfx called for hero_id={}, ko_mode={}", hero_id, is_ko);
+    let should_force = force_refresh.unwrap_or(false);
+    eprintln!("[DEBUG] extract_hero_vfx called for hero_id={}, ko_mode={}, force_refresh={}", hero_id, is_ko, should_force);
 
     let sub_dir = if is_ko { "ko" } else { "vfx" };
     let extract_dir = get_hero_cache_dir().join(sub_dir).join("extracted").join(&hero_id);
     let json_dir = get_hero_cache_dir().join(sub_dir).join("json").join(&hero_id);
+
+    if should_force {
+        eprintln!("[DEBUG] force_refresh requested: clearing cached extracted and json dirs for hero {}", hero_id);
+        if extract_dir.exists() {
+            let _ = fs::remove_dir_all(&extract_dir);
+        }
+        if json_dir.exists() {
+            let _ = fs::remove_dir_all(&json_dir);
+        }
+    }
 
     // Check if already extracted
     let existing_uassets = if extract_dir.exists() { find_files_recursive(&extract_dir, ".uasset") } else { vec![] };
@@ -2410,7 +2423,6 @@ async fn extract_hero_vfx(
         "usmap_path": usmap_path,
     });
 
-    let mut json_paths = Vec::new();
     match send_tool_request(proc, &request).await {
         Ok(resp) => {
             let success = resp.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -2435,7 +2447,7 @@ async fn extract_hero_vfx(
     drop(process_guard);
 
     // Build json_paths by scanning the json output directory recursively
-    json_paths = find_files_recursive(&json_dir, ".json")
+    let json_paths: Vec<String> = find_files_recursive(&json_dir, ".json")
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();

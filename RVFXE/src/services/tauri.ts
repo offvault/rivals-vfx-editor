@@ -10,6 +10,7 @@ import type {
   HeroVfxResult,
   AssetIndexResult,
   UsmapStatus,
+  TelemetrySnapshot,
 } from '@/types';
 
 const { invoke } = (window as any).__TAURI__.core;
@@ -59,6 +60,31 @@ export async function setHeaderMinimized(isMinimized: boolean): Promise<void> {
 export async function setPakReadyStructure(enabled: boolean): Promise<void> {
   console.debug('[tauri] Setting pak ready structure:', enabled);
   return invoke('set_pak_ready_structure', { enabled });
+}
+
+export async function setEnableTelemetry(enabled: boolean): Promise<void> {
+  console.debug('[tauri] Setting enable telemetry:', enabled);
+  return invoke('set_enable_telemetry', { enabled });
+}
+
+export async function getTelemetrySnapshot(): Promise<TelemetrySnapshot> {
+  return invoke('get_telemetry_snapshot');
+}
+
+export async function getDiagnosticLogs(limit?: number): Promise<string[]> {
+  return invoke('get_diagnostic_logs', { limit: limit ?? null });
+}
+
+export async function clearDiagnosticLogs(): Promise<void> {
+  return invoke('clear_diagnostic_logs');
+}
+
+export async function openLogFolder(): Promise<void> {
+  return invoke('open_log_folder');
+}
+
+export async function logFrontendMessage(level: string, message: string): Promise<void> {
+  return invoke('log_frontend_message', { level, message });
 }
 
 export async function applyWebviewUiScale(scale: number): Promise<void> {

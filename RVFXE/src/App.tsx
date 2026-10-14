@@ -3,7 +3,7 @@ import type {
   ColorParam, RGBA, AppSettings, CacheInfo, ConversionProgress,
   FilterDictionary, SortConfig, UassetSourceMap, FileObject, SessionEntry,
   UsmapStatus, BatchHeroSlot, RvfxpPresetV2, RvfxpRecipe, QueuedPresetSlot,
-  ExportMatrixOptions, ExportSlotConfig,
+  ExportMatrixOptions, ExportSlotConfig, RvfxpSlot,
 } from '@/types';
 import { useHistory } from '@/hooks/useHistory';
 import { useDebugLog } from '@/hooks/useDebugLog';
@@ -38,6 +38,7 @@ import {
   RvfxpImportModal,
   VfxUpdaterModal,
   SaveModModal,
+  DiagnosticConsoleModal,
 } from '@/components/modals';
 import '../css/tailwind.min.css';
 import '../css/fonts.css';
@@ -149,6 +150,7 @@ export function App() {
   const [showTwelveColorModal, setShowTwelveColorModal] = useState(false);
   const [showVfxUpdater, setShowVfxUpdater] = useState(false);
   const [updaterInitialModPath, setUpdaterInitialModPath] = useState<string | null>(null);
+  const [showDiagnosticConsole, setShowDiagnosticConsole] = useState(false);
 
   // === SAVE MOD MODAL STATE ===
   const [showSaveModModal, setShowSaveModModal] = useState(false);
@@ -1280,6 +1282,26 @@ export function App() {
         return;
       }
 
+      // Check if this is a Master Workspace Profile
+      if (presetV2 && (presetV2.isWorkspaceProfile || (presetV2.slots && presetV2.slots.length > 1))) {
+        debug.addLog(`Importing Master Workspace Profile with ${presetV2.slots.length} slots...`);
+        const roster = await tauri.getHeroRoster(false).catch(() => ({ heroes: [] }));
+        const queuedSlots: QueuedPresetSlot[] = presetV2.slots.map((s, idx) => {
+          const hName = s.heroName || roster.heroes.find(h => h.hero_id === s.heroId)?.display_name || `Hero ${s.heroId}`;
+          return {
+            slotId: s.slotId || `slot_${Date.now()}_${idx}`,
+            heroId: s.heroId,
+            heroName: hName,
+            customLabel: s.customLabel || `${hName}_VFX`,
+            bundleGroup: s.bundleGroup,
+            recipe: s.recipe || presetV2?.recipe,
+            sessionData: s.sessionData || (idx === 0 ? presetV2?.savedParameters : undefined) || [],
+          };
+        });
+        await handleBatchLoadHeroes(queuedSlots, false);
+        return;
+      }
+
       let detectedHeroId: string | null = null;
       if (presetV2 && presetV2.slots && presetV2.slots.length > 0) {
         detectedHeroId = presetV2.slots[0].heroId;
@@ -1422,48 +1444,110 @@ export function App() {
     }
   }, [pendingRvfxp, currentHeroId, debug, fetchHeroVfxData, setInitialHistory]);
 
-  // === EXPORT CURRENT SESSION FILE (VERSION 2 RECIPE PRESET) ===
+  // === EXPORT CURRENT SESSION FILE (VERSION 2 RECIPE PRESET & MASTER WORKSPACE PROFILES) ===
   const handleExportSession = useCallback(async () => {
-    if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
-    const sessionData: SessionEntry[] = colorParams.filter(p => selectedParams.has(p.id)).map(p => ({
-      relativePath: p.relativePath.replace(/\.json$/i, ''),
-      paramName: p.paramName,
-      rgba: p.rgba,
-    }));
+    const isWorkspace = isBatchMode && batchSlots.length > 1;
 
-    const currentRecipe = compileCurrentRecipe();
-    const cleanMod = sessionName.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
-    const presetV2: RvfxpPresetV2 = {
-      version: 2,
-      generator: 'RivalsVFXEditor',
-      timestamp: new Date().toISOString(),
-      recipe: currentRecipe,
-      slots: [
-        {
-          slotId: activeSlotId || 'slot_active',
-          heroId: currentHeroId || 'unknown',
-          heroName: currentHeroName || 'Unknown Hero',
-          customLabel: cleanMod,
-        },
-      ],
-      savedParameters: sessionData,
-    };
+    let presetV2: RvfxpPresetV2;
+    let defaultFileName: string;
+
+    if (isWorkspace) {
+      const activeRecipe = compileCurrentRecipe();
+      const activeSessionData: SessionEntry[] = colorParams
+        .filter(p => selectedParams.has(p.id))
+        .map(p => ({
+          relativePath: p.relativePath.replace(/\.json$/i, ''),
+          paramName: p.paramName,
+          rgba: p.rgba,
+        }));
+
+      const exportSlots: RvfxpSlot[] = batchSlots.map(s => {
+        if (s.slotId === activeSlotId) {
+          return {
+            slotId: s.slotId,
+            heroId: s.heroId,
+            heroName: s.heroName,
+            customLabel: sessionName,
+            bundleGroup: s.bundleGroup,
+            recipe: activeRecipe,
+            sessionData: activeSessionData,
+          };
+        } else {
+          const slotData: SessionEntry[] = s.colorParams
+            .filter(p => s.selectedParams.has(p.id))
+            .map(p => ({
+              relativePath: p.relativePath.replace(/\.json$/i, ''),
+              paramName: p.paramName,
+              rgba: p.rgba,
+            }));
+          return {
+            slotId: s.slotId,
+            heroId: s.heroId,
+            heroName: s.heroName,
+            customLabel: s.customLabel,
+            bundleGroup: s.bundleGroup,
+            recipe: s.recipe,
+            sessionData: slotData,
+          };
+        }
+      });
+
+      defaultFileName = `${sessionName.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_')}_MasterWorkspace.rvfxp`;
+      presetV2 = {
+        version: 2,
+        generator: 'RivalsVFXEditor',
+        timestamp: new Date().toISOString(),
+        isWorkspaceProfile: true,
+        recipe: activeRecipe,
+        slots: exportSlots,
+        savedParameters: activeSessionData,
+      };
+    } else {
+      if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
+      const sessionData: SessionEntry[] = colorParams.filter(p => selectedParams.has(p.id)).map(p => ({
+        relativePath: p.relativePath.replace(/\.json$/i, ''),
+        paramName: p.paramName,
+        rgba: p.rgba,
+      }));
+
+      const currentRecipe = compileCurrentRecipe();
+      const cleanMod = sessionName.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
+      defaultFileName = sessionName.endsWith('.rvfxp') ? sessionName : `${sessionName}.rvfxp`;
+      presetV2 = {
+        version: 2,
+        generator: 'RivalsVFXEditor',
+        timestamp: new Date().toISOString(),
+        isWorkspaceProfile: false,
+        recipe: currentRecipe,
+        slots: [
+          {
+            slotId: activeSlotId || 'slot_active',
+            heroId: currentHeroId || 'unknown',
+            heroName: currentHeroName || 'Unknown Hero',
+            customLabel: cleanMod,
+            recipe: currentRecipe,
+            sessionData,
+          },
+        ],
+        savedParameters: sessionData,
+      };
+    }
 
     try {
-      const fileName = sessionName.endsWith('.rvfxp') ? sessionName : `${sessionName}.rvfxp`;
       const filePath = await tauri.saveDialog({
-        title: 'Export Project Preset (.rvfxp)',
-        defaultPath: fileName,
+        title: isWorkspace ? 'Export Master Workspace Profile (.rvfxp)' : 'Export Project Preset (.rvfxp)',
+        defaultPath: defaultFileName,
         filters: [{ name: 'RVFX Project', extensions: ['rvfxp'] }],
       });
       if (!filePath) return;
       await tauri.writeTextFile(filePath as string, JSON.stringify(presetV2, null, 2));
-      alert('Project preset exported successfully (Version 2)!');
+      alert(isWorkspace ? `Master Workspace Profile exported (${presetV2.slots.length} heroes)!` : 'Project preset exported successfully (Version 2)!');
+      debug.addLog(`✓ Exported preset to ${filePath}`);
     } catch (err: any) {
       alert(`Failed to export session: ${err.message || err}`);
     }
   }, [
-    selectedParams, colorParams, sessionName, activeSlotId, currentHeroId, currentHeroName, compileCurrentRecipe,
+    isBatchMode, batchSlots, activeSlotId, colorParams, selectedParams, sessionName, currentHeroId, currentHeroName, compileCurrentRecipe, debug,
   ]);
 
   // === FULL RESET ===
@@ -1531,6 +1615,26 @@ export function App() {
           sessionData = parsed.savedParameters || [];
         } else if (Array.isArray(parsed)) {
           sessionData = parsed;
+        }
+
+        // Check if this single file is a Master Workspace Profile
+        if (presetV2 && (presetV2.isWorkspaceProfile || (presetV2.slots && presetV2.slots.length > 1))) {
+          debug.addLog(`Loading Master Workspace Profile with ${presetV2.slots.length} slots...`);
+          const roster = await tauri.getHeroRoster(false).catch(() => ({ heroes: [] }));
+          const queuedSlots: QueuedPresetSlot[] = presetV2.slots.map((s, idx) => {
+            const hName = s.heroName || roster.heroes.find(h => h.hero_id === s.heroId)?.display_name || `Hero ${s.heroId}`;
+            return {
+              slotId: s.slotId || `slot_${Date.now()}_${idx}`,
+              heroId: s.heroId,
+              heroName: hName,
+              customLabel: s.customLabel || `${hName}_VFX`,
+              bundleGroup: s.bundleGroup,
+              recipe: s.recipe || presetV2?.recipe,
+              sessionData: s.sessionData || (idx === 0 ? presetV2?.savedParameters : undefined) || [],
+            };
+          });
+          await handleBatchLoadHeroes(queuedSlots, false);
+          return;
         }
 
         let detectedHeroId: string | null = null;
@@ -1708,6 +1812,7 @@ export function App() {
           onOpenSettings={() => setShowSettings(true)}
           onOpenFilterSettings={() => setShowFilterSettings(true)}
           onOpenVfxUpdater={() => setShowVfxUpdater(true)}
+          onOpenConsole={() => setShowDiagnosticConsole(true)}
           onCloseProject={handleBackToMenu}
           onReset={handleReset}
           addDebugLog={debug.addLog}
@@ -2098,6 +2203,10 @@ export function App() {
           }}
           addDebugLog={debug.addLog}
         />
+      )}
+
+      {showDiagnosticConsole && (
+        <DiagnosticConsoleModal onClose={() => setShowDiagnosticConsole(false)} />
       )}
 
       <SaveModModal

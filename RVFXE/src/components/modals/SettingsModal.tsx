@@ -274,6 +274,17 @@ export function SettingsModal({
             }}
           />
 
+          {/* Diagnostic Telemetry & RAM/CPU Logging Toggle */}
+          <ToggleSwitch
+            label="Diagnostic Telemetry & RAM/CPU Logging"
+            enabled={settings.enableTelemetry ?? true}
+            setEnabled={async (val) => {
+              console.debug('[SettingsModal] Setting enableTelemetry:', val);
+              await tauri.setEnableTelemetry(val);
+              setSettings(prev => ({ ...prev, enableTelemetry: val }));
+            }}
+          />
+
           {/* Auto Clear Cache Toggle */}
           <ToggleSwitch
             label="Auto Clear VFX Cache on Exit"

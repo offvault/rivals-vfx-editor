@@ -20,6 +20,8 @@ use reqwest;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+pub mod telemetry;
+
 // ============================================================================
 // STATE & TYPES
 // ============================================================================
@@ -96,6 +98,8 @@ pub struct AppSettings {
     pub is_header_minimized: bool,
     #[serde(default = "default_true")]
     pub pak_ready_structure: bool,
+    #[serde(default = "default_true")]
+    pub enable_telemetry: bool,
 }
 
 fn default_ui_scale() -> f64 {
@@ -117,6 +121,7 @@ impl Default for AppSettings {
             filter_dictionary: FilterDictionary::default(),
             is_header_minimized: false,
             pak_ready_structure: true,
+            enable_telemetry: true,
         }
     }
 }
@@ -607,6 +612,42 @@ fn set_pak_ready_structure(enabled: bool, state: State<AppState>) -> Result<(), 
     let mut settings = state.settings.lock().unwrap();
     settings.pak_ready_structure = enabled;
     save_settings(&settings)
+}
+
+#[tauri::command]
+fn set_enable_telemetry(enabled: bool, state: State<AppState>) -> Result<(), String> {
+    telemetry::set_telemetry_enabled(enabled);
+    let mut settings = state.settings.lock().unwrap();
+    settings.enable_telemetry = enabled;
+    save_settings(&settings)
+}
+
+#[tauri::command]
+fn get_telemetry_snapshot() -> Result<telemetry::TelemetrySnapshot, String> {
+    Ok(telemetry::sample_telemetry())
+}
+
+#[tauri::command]
+fn get_diagnostic_logs(limit: Option<usize>) -> Result<Vec<String>, String> {
+    Ok(telemetry::get_recent_logs(limit))
+}
+
+#[tauri::command]
+fn clear_diagnostic_logs() -> Result<(), String> {
+    telemetry::clear_in_memory_logs();
+    Ok(())
+}
+
+#[tauri::command]
+fn open_log_folder() -> Result<(), String> {
+    let log_dir = telemetry::get_log_dir();
+    open_folder(log_dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn log_frontend_message(level: String, message: String) -> Result<(), String> {
+    telemetry::log_with_level(&level, message);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3727,10 +3768,10 @@ async fn update_vfx_mod(
     usmap_path: Option<String>,
     output_dir: String,
 ) -> Result<UpdateVfxModResult, String> {
-    eprintln!(
-        "[DEBUG] update_vfx_mod called with mod_path={}, usmap={:?}, output_dir={}",
+    telemetry::log_info(format!(
+        "VFX Mod Updater started: mod_path={}, usmap={:?}, output_dir={}",
         mod_path, usmap_path, output_dir
-    );
+    ));
 
     let paks_path = {
         let settings = state.settings.lock().unwrap();
@@ -3748,6 +3789,31 @@ async fn update_vfx_mod(
 
     let tool_path = get_uasset_tool_path(&app);
 
+    // Resolve mod path: if .pak was passed and a sibling .utoc exists, use .utoc for IoStore
+    let mod_path_obj = Path::new(&mod_path);
+    let is_pak_input = mod_path_obj
+        .extension()
+        .map_or(false, |e| e.eq_ignore_ascii_case("pak"));
+
+    let resolved_mod_path = if is_pak_input {
+        let utoc_candidate = mod_path_obj.with_extension("utoc");
+        if utoc_candidate.exists() {
+            telemetry::log_info(format!(
+                "Found companion IoStore container: {}. Using IoStore pipeline.",
+                utoc_candidate.display()
+            ));
+            utoc_candidate.to_string_lossy().to_string()
+        } else {
+            mod_path.clone()
+        }
+    } else {
+        mod_path.clone()
+    };
+
+    let is_iostore_container = resolved_mod_path
+        .to_lowercase()
+        .ends_with(".utoc");
+
     // Create a temporary extraction directory
     let temp_dir = tempfile::Builder::new()
         .prefix("rvfxe-updater-")
@@ -3756,49 +3822,75 @@ async fn update_vfx_mod(
     let temp_extract = temp_dir.path().to_path_buf();
 
     // Step 1: Extract legacy assets from the mod container
-    let mut extract_args = vec![
-        "extract_iostore_legacy".to_string(),
-        paks_path,
-        temp_extract.to_string_lossy().to_string(),
-        "--mod".to_string(),
-        mod_path.clone(),
-    ];
-    if let Some(ref usm) = effective_usmap {
-        extract_args.push("--usmap".to_string());
-        extract_args.push(usm.clone());
-    }
+    telemetry::log_info(format!(
+        "Step 1: Extracting assets from {} to temporary workspace...",
+        resolved_mod_path
+    ));
+
+    let extract_args = if is_iostore_container {
+        let mut args = vec![
+            "extract_iostore_legacy".to_string(),
+            paks_path,
+            temp_extract.to_string_lossy().to_string(),
+            "--mod".to_string(),
+            resolved_mod_path.clone(),
+        ];
+        if let Some(ref usm) = effective_usmap {
+            args.push("--usmap".to_string());
+            args.push(usm.clone());
+        }
+        args
+    } else {
+        vec![
+            "extract_pak".to_string(),
+            resolved_mod_path.clone(),
+            temp_extract.to_string_lossy().to_string(),
+        ]
+    };
 
     let extract_refs: Vec<&str> = extract_args.iter().map(|s| s.as_str()).collect();
     let (stdout, stderr) = run_uasset_tool_cli(&tool_path, &extract_refs).await?;
-    eprintln!("[DEBUG] Updater extract stdout: {}", stdout);
+    telemetry::log_debug(format!("Updater extract output: {}", stdout));
     if !stderr.is_empty() {
-        eprintln!("[DEBUG] Updater extract stderr: {}", stderr);
+        telemetry::log_warn(format!("Updater extract warning: {}", stderr));
     }
 
     // Check if any legacy files were extracted
     let extracted_files = find_files_recursive(&temp_extract, ".uasset");
     if extracted_files.is_empty() {
+        let err_msg = format!(
+            "No material or package files could be extracted from: {}. Ensure the container is not corrupted and valid game paks path is set.",
+            resolved_mod_path
+        );
+        telemetry::log_error(&err_msg);
         return Ok(UpdateVfxModResult {
             success: false,
-            message: format!(
-                "No packages could be extracted from mod: {}. Make sure the .utoc file is valid.",
-                mod_path
-            ),
+            message: err_msg,
             output_path: None,
         });
     }
 
+    telemetry::log_info(format!(
+        "✓ Extracted {} package files from legacy mod",
+        extracted_files.len()
+    ));
+
     // Step 2: Repackage into updated mod IoStore bundle
-    let mod_file_path = Path::new(&mod_path);
-    let mod_name = mod_file_path
+    let mod_stem = mod_path_obj
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+    let clean_mod_name = mod_stem.replace("_Updated", "");
 
     let target_out_dir = PathBuf::from(&output_dir);
     fs::create_dir_all(&target_out_dir).map_err(|e| e.to_string())?;
-    let output_bundle_base = target_out_dir.join(format!("{}_Updated", mod_name));
+    let output_bundle_base = target_out_dir.join(format!("{}_Updated", clean_mod_name));
+
+    telemetry::log_info(format!(
+        "Step 2: Repackaging into updated IoStore container: {}...",
+        output_bundle_base.display()
+    ));
 
     let repack_args = vec![
         "create_mod_iostore".to_string(),
@@ -3807,19 +3899,22 @@ async fn update_vfx_mod(
     ];
     let repack_refs: Vec<&str> = repack_args.iter().map(|s| s.as_str()).collect();
     let (repack_stdout, repack_stderr) = run_uasset_tool_cli(&tool_path, &repack_refs).await?;
-    eprintln!("[DEBUG] Updater repack stdout: {}", repack_stdout);
+    telemetry::log_debug(format!("Updater repack output: {}", repack_stdout));
     if !repack_stderr.is_empty() {
-        eprintln!("[DEBUG] Updater repack stderr: {}", repack_stderr);
+        telemetry::log_warn(format!("Updater repack warning: {}", repack_stderr));
     }
 
-    let result_utoc = format!("{}_Updated.utoc", output_bundle_base.to_string_lossy());
+    let result_utoc = format!("{}.utoc", output_bundle_base.to_string_lossy());
+    let success_msg = format!(
+        "Successfully updated mod with {} assets! Game-ready container created: {}",
+        extracted_files.len(),
+        result_utoc
+    );
+    telemetry::log_info(&success_msg);
+
     Ok(UpdateVfxModResult {
         success: true,
-        message: format!(
-            "Successfully updated mod with {} assets! Output created at: {}",
-            extracted_files.len(),
-            result_utoc
-        ),
+        message: success_msg,
         output_path: Some(result_utoc),
     })
 }
@@ -4161,7 +4256,9 @@ async fn package_iostore_mod(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    telemetry::init_logger();
     let settings = load_settings();
+    telemetry::set_telemetry_enabled(settings.enable_telemetry);
     let cache_index = load_cache_index();
 
     tauri::Builder::default()
@@ -4184,6 +4281,12 @@ pub fn run() {
             set_filter_dictionary,
             set_header_minimized,
             set_pak_ready_structure,
+            set_enable_telemetry,
+            get_telemetry_snapshot,
+            get_diagnostic_logs,
+            clear_diagnostic_logs,
+            open_log_folder,
+            log_frontend_message,
             get_cache_info,
             clear_cache,
             convert_uasset_to_json,

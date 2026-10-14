@@ -148,10 +148,7 @@ export function VfxUpdaterModal({
         <div className="p-4 border-b flex justify-between items-center" style={{ borderColor: '#262930' }}>
           <div className="flex items-center gap-2">
             <span className="text-xl font-black tracking-widest bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
-              REPAK VFX
-            </span>
-            <span className="text-xs px-2 py-0.5 font-mono rounded bg-blue-900/40 text-blue-300 border border-blue-700/50">
-              UPDATER
+              VFX UPDATER
             </span>
           </div>
           <button onClick={onClose} disabled={isUpdating} className="text-gray-400 hover:text-white text-lg">

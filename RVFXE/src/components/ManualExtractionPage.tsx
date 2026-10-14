@@ -4,7 +4,9 @@ import * as tauri from '@/services/tauri';
 // Module-level cache so the index survives leaving and re-entering the page.
 let assetIndexCache: string[] | null = null;
 
-const MAX_SEARCH_RESULTS = 500;
+const MAX_SEARCH_RESULTS = 1000;
+const ROW_HEIGHT = 28;
+const BUFFER_ROWS = 12;
 
 // Row banding and hover live in css/style.css: the vendored tailwind build has
 // no slash-opacity utilities, so `bg-white/5` and the like resolve to nothing.
@@ -33,9 +35,7 @@ function makeNode(name: string, path: string): TreeNode {
 
 /**
  * Build the folder tree from the flat, sorted path list.
- *
- * The index is ~130k entries, so this runs once per index load and is memoized;
- * rendering stays cheap because only expanded folders are ever walked.
+ * The index is ~130k entries, so this runs once per index load and is memoized.
  */
 function buildTree(paths: string[]): TreeNode {
   const root = makeNode('', '');
@@ -87,6 +87,30 @@ function displayPath(path: string): string {
   return idx >= 0 ? path.slice(idx + '/Content/'.length) : path;
 }
 
+/** Flat row descriptor for high-scale list virtualization. */
+type FlatRow =
+  | { type: 'dir'; node: TreeNode; depth: number; path: string }
+  | { type: 'file'; name: string; path: string; depth: number };
+
+function flattenTree(tree: TreeNode, expanded: Set<string>): FlatRow[] {
+  const rows: FlatRow[] = [];
+  function walkDir(dir: TreeNode, depth: number) {
+    rows.push({ type: 'dir', node: dir, depth, path: dir.path });
+    if (expanded.has(dir.path)) {
+      for (const childDir of dir.dirs.values()) {
+        walkDir(childDir, depth + 1);
+      }
+      for (const file of dir.files) {
+        rows.push({ type: 'file', name: file.name, path: file.path, depth: depth + 1 });
+      }
+    }
+  }
+  for (const rootDir of tree.dirs.values()) {
+    walkDir(rootDir, 0);
+  }
+  return rows;
+}
+
 /** Queue checkbox shared by folder and file rows. */
 function QueueCheckbox({ checked, indeterminate = false }: { checked: boolean; indeterminate?: boolean }) {
   const active = checked || indeterminate;
@@ -94,13 +118,14 @@ function QueueCheckbox({ checked, indeterminate = false }: { checked: boolean; i
     <span
       className="w-3.5 h-3.5 flex-shrink-0 border flex items-center justify-center"
       style={{
-        // --bg-1 sat a shade off the hover fill and vanished under the cursor.
         borderColor: active ? 'var(--accent-main)' : 'var(--text-4)',
         backgroundColor: checked ? 'var(--accent-main)' : 'transparent',
       }}
     >
       {checked && (
-        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="var(--bg-4)" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="var(--bg-4)" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="20 6 9 17 4 12" />
+        </svg>
       )}
       {indeterminate && !checked && (
         <span className="w-1.5 h-0.5" style={{ backgroundColor: 'var(--accent-main)' }} />
@@ -118,6 +143,17 @@ export function ManualExtractionPage({ onClose, onExtract, addDebugLog }: Manual
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [queue, setQueue] = useState<string[]>([]);
   const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // Keyboard navigation & Escape handler
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
 
   const loadIndex = useCallback(async (forceRefresh: boolean) => {
     setLoading(true);
@@ -145,7 +181,7 @@ export function ManualExtractionPage({ onClose, onExtract, addDebugLog }: Manual
     if (assetIndexCache === null) loadIndex(false);
   }, [loadIndex]);
 
-  // Debounce search - each keystroke scans the whole index.
+  // Debounce search
   useEffect(() => {
     const handle = setTimeout(() => setDebouncedSearch(searchTerm.trim().toLowerCase()), 200);
     return () => clearTimeout(handle);
@@ -153,8 +189,7 @@ export function ManualExtractionPage({ onClose, onExtract, addDebugLog }: Manual
 
   const tree = useMemo(() => buildTree(assets), [assets]);
 
-  // Plugin content nests under its mount, so the index has a single `Marvel`
-  // root - leaving it shut would put every asset one click further away.
+  // Expand root level by default
   useEffect(() => {
     const roots = Array.from(tree.dirs.keys());
     if (roots.length > 0) setExpanded(new Set(roots));
@@ -162,8 +197,7 @@ export function ManualExtractionPage({ onClose, onExtract, addDebugLog }: Manual
 
   const queueSet = useMemo(() => new Set(queue), [queue]);
 
-  // Queued descendants per folder, so a folder row can show checked /
-  // indeterminate without walking its subtree on every render.
+  // Queued descendants per folder
   const queuedCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const path of queue) {
@@ -241,79 +275,181 @@ export function ManualExtractionPage({ onClose, onExtract, addDebugLog }: Manual
     onExtract(queue);
   }, [queue, onExtract]);
 
+  // ===================== TREE VIRTUALIZATION =====================
+  const flatRows = useMemo(() => {
+    return flattenTree(tree, expanded);
+  }, [tree, expanded]);
+
+  const treeContainerRef = useRef<HTMLDivElement>(null);
+  const [treeScrollTop, setTreeScrollTop] = useState(0);
+  const [treeViewportHeight, setTreeViewportHeight] = useState(600);
+
+  useEffect(() => {
+    const el = treeContainerRef.current;
+    if (!el) return;
+    const updateSize = () => {
+      if (el.clientHeight > 0) setTreeViewportHeight(el.clientHeight);
+    };
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const treeTotalRows = flatRows.length;
+  const treeTotalHeight = treeTotalRows * ROW_HEIGHT;
+  const treeStartIndex = Math.max(0, Math.floor(treeScrollTop / ROW_HEIGHT) - BUFFER_ROWS);
+  const treeEndIndex = Math.min(treeTotalRows, Math.ceil((treeScrollTop + treeViewportHeight) / ROW_HEIGHT) + BUFFER_ROWS);
+  const visibleTreeRows = useMemo(() => {
+    return flatRows.slice(treeStartIndex, treeEndIndex);
+  }, [flatRows, treeStartIndex, treeEndIndex]);
+  const treeOffsetY = treeStartIndex * ROW_HEIGHT;
+
+  // ===================== SEARCH VIRTUALIZATION =====================
+  const searchContainerRef = useRef<HTMLDivElement>(null);
+  const [searchScrollTop, setSearchScrollTop] = useState(0);
+  const [searchViewportHeight, setSearchViewportHeight] = useState(600);
+
+  useEffect(() => {
+    const el = searchContainerRef.current;
+    if (!el) return;
+    const updateSize = () => {
+      if (el.clientHeight > 0) setSearchViewportHeight(el.clientHeight);
+    };
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [searchResults]);
+
+  const searchTotalRows = searchResults ? Math.min(searchResults.length, MAX_SEARCH_RESULTS) : 0;
+  const searchTotalHeight = searchTotalRows * ROW_HEIGHT;
+  const searchStartIndex = Math.max(0, Math.floor(searchScrollTop / ROW_HEIGHT) - BUFFER_ROWS);
+  const searchEndIndex = Math.min(searchTotalRows, Math.ceil((searchScrollTop + searchViewportHeight) / ROW_HEIGHT) + BUFFER_ROWS);
+  const visibleSearchResults = useMemo(() => {
+    if (!searchResults) return [];
+    return searchResults.slice(searchStartIndex, searchEndIndex);
+  }, [searchResults, searchStartIndex, searchEndIndex]);
+  const searchOffsetY = searchStartIndex * ROW_HEIGHT;
+
+  // ===================== QUEUE VIRTUALIZATION =====================
+  const queueContainerRef = useRef<HTMLDivElement>(null);
+  const [queueScrollTop, setQueueScrollTop] = useState(0);
+  const [queueViewportHeight, setQueueViewportHeight] = useState(600);
+
+  useEffect(() => {
+    const el = queueContainerRef.current;
+    if (!el) return;
+    const updateSize = () => {
+      if (el.clientHeight > 0) setQueueViewportHeight(el.clientHeight);
+    };
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const queueTotalRows = queue.length;
+  const queueTotalHeight = queueTotalRows * ROW_HEIGHT;
+  const queueStartIndex = Math.max(0, Math.floor(queueScrollTop / ROW_HEIGHT) - BUFFER_ROWS);
+  const queueEndIndex = Math.min(queueTotalRows, Math.ceil((queueScrollTop + queueViewportHeight) / ROW_HEIGHT) + BUFFER_ROWS);
+  const visibleQueueRows = useMemo(() => {
+    return queue.slice(queueStartIndex, queueEndIndex);
+  }, [queue, queueStartIndex, queueEndIndex]);
+  const queueOffsetY = queueStartIndex * ROW_HEIGHT;
+
+  // ===================== ROW RENDERERS =====================
+  const renderFolderRow = (node: TreeNode, depth: number, striped: boolean) => {
+    const isOpen = expanded.has(node.path);
+    const queuedHere = queuedCounts.get(node.path) ?? 0;
+    const allQueued = node.fileCount > 0 && queuedHere >= node.fileCount;
+
+    return (
+      <div
+        key={node.path || 'root'}
+        className={`flex items-center gap-1.5 px-2 cursor-pointer text-sm group/row ${striped ? STRIPE_CLASS : ROW_CLASS}`}
+        style={{
+          paddingLeft: `${depth * 14 + 8}px`,
+          color: 'var(--text-2)',
+          height: `${ROW_HEIGHT}px`,
+          boxSizing: 'border-box',
+        }}
+        onClick={() => toggleExpand(node.path)}
+      >
+        <svg
+          className="flex-shrink-0 transition-transform"
+          style={{ transform: isOpen ? 'rotate(90deg)' : 'none' }}
+          width="12"
+          height="12"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="3"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <polyline points="9 18 15 12 9 6" />
+        </svg>
+        <span
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleFolder(node);
+          }}
+          title={
+            allQueued
+              ? `Remove all ${node.fileCount} material instances in this folder from the queue`
+              : `Queue all ${node.fileCount} material instances in this folder`
+          }
+          className="flex items-center"
+        >
+          <QueueCheckbox checked={allQueued} indeterminate={queuedHere > 0 && !allQueued} />
+        </span>
+        <span className="truncate flex-1 font-mono text-xs">{node.name}</span>
+        <span className="text-xs flex-shrink-0 font-mono pr-2" style={{ color: 'var(--text-4)' }}>
+          {queuedHere > 0 && <span style={{ color: 'var(--accent-main)' }}>{queuedHere}/</span>}
+          {node.fileCount}
+        </span>
+      </div>
+    );
+  };
+
   const renderFileRow = (name: string, path: string, depth: number, striped: boolean) => {
     const queued = queueSet.has(path);
     return (
       <div
         key={path}
         onClick={() => toggleFile(path)}
-        className={`flex items-center gap-2 px-2 py-1 cursor-pointer text-sm ${striped ? STRIPE_CLASS : ROW_CLASS}`}
-        style={{ paddingLeft: `${depth * 14 + 8}px`, color: queued ? 'var(--accent-main)' : 'var(--text-3)' }}
+        className={`flex items-center gap-2 px-2 cursor-pointer text-sm ${striped ? STRIPE_CLASS : ROW_CLASS}`}
+        style={{
+          paddingLeft: `${depth * 14 + 8}px`,
+          color: queued ? 'var(--accent-main)' : 'var(--text-3)',
+          height: `${ROW_HEIGHT}px`,
+          boxSizing: 'border-box',
+        }}
         title={displayPath(path)}
       >
         <QueueCheckbox checked={queued} />
-        <span className="truncate">{name.replace(/\.uasset$/, '')}</span>
-      </div>
-    );
-  };
-
-  const renderFolder = (node: TreeNode, depth: number, row: { i: number }) => {
-    const isOpen = expanded.has(node.path);
-    const queuedHere = queuedCounts.get(node.path) ?? 0;
-    const allQueued = queuedHere >= node.fileCount;
-
-    // Claimed before the children are built so the banding runs down the
-    // rendered rows in visual order rather than restarting at each level.
-    const striped = row.i++ % 2 === 1;
-
-    const children: React.ReactNode[] = [];
-    if (isOpen) {
-      for (const dir of node.dirs.values()) children.push(renderFolder(dir, depth + 1, row));
-      for (const file of node.files) children.push(renderFileRow(file.name, file.path, depth + 1, row.i++ % 2 === 1));
-    }
-
-    return (
-      <div key={node.path || 'root'}>
-        <div
-          className={`flex items-center gap-1.5 px-2 py-1 cursor-pointer text-sm group/row ${striped ? STRIPE_CLASS : ROW_CLASS}`}
-          style={{ paddingLeft: `${depth * 14 + 8}px`, color: 'var(--text-2)' }}
-          onClick={() => toggleExpand(node.path)}
-        >
-          <svg
-            className="flex-shrink-0 transition-transform"
-            style={{ transform: isOpen ? 'rotate(90deg)' : 'none' }}
-            width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"
-          >
-            <polyline points="9 18 15 12 9 6" />
-          </svg>
-          <span
-            onClick={(e) => { e.stopPropagation(); toggleFolder(node); }}
-            title={allQueued
-              ? `Remove all ${node.fileCount} material instances in this folder from the queue`
-              : `Queue all ${node.fileCount} material instances in this folder`}
-            className="flex items-center"
-          >
-            <QueueCheckbox checked={allQueued} indeterminate={queuedHere > 0} />
-          </span>
-          <span className="truncate flex-1">{node.name}</span>
-          <span className="text-xs flex-shrink-0" style={{ color: 'var(--text-4)' }}>
-            {queuedHere > 0 && (
-              <span style={{ color: 'var(--accent-main)' }}>{queuedHere}/</span>
-            )}
-            {node.fileCount}
-          </span>
-        </div>
-        {children}
+        <span className="truncate font-mono text-xs">{name.replace(/\.uasset$/, '')}</span>
       </div>
     );
   };
 
   return (
     <div className="flex-1 flex flex-col min-h-0 border-2" style={{ backgroundColor: 'var(--bg-3)', borderColor: 'var(--bg-2)' }}>
-
       {/* Header */}
       <div className="flex justify-between items-center p-4 border-b flex-shrink-0" style={{ borderColor: 'var(--bg-2)' }}>
         <div className="flex items-center gap-3">
+          <button
+            onClick={onClose}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold hover:bg-white/10 transition-colors border shadow-sm"
+            style={{ backgroundColor: 'var(--bg-2)', borderColor: 'var(--bg-1)', color: 'var(--text-1)' }}
+            title="Return to VFX Editor (Escape)"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M19 12H5M12 19l-7-7 7-7" />
+            </svg>
+            ← Back to Editor
+          </button>
           <h2 className="text-xl font-bold" style={{ color: 'var(--text-1)' }}>Manual Extraction</h2>
           <span className="text-sm px-2 py-0.5" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-4)' }}>
             {assets.length.toLocaleString()} material instances
@@ -333,7 +469,7 @@ export function ManualExtractionPage({ onClose, onExtract, addDebugLog }: Manual
           </button>
           <button
             onClick={onClose}
-            title="Back"
+            title="Close (Escape)"
             className="p-1 rounded hover:bg-white/10 transform hover:scale-125 transition-transform duration-200"
             style={{ color: 'var(--text-2)' }}
           >
@@ -346,7 +482,7 @@ export function ManualExtractionPage({ onClose, onExtract, addDebugLog }: Manual
         <div className="flex-1 flex flex-col items-center justify-center">
           <div className="animate-spin w-8 h-8 border-2 border-t-transparent rounded-full mb-4" style={{ borderColor: 'var(--accent-main)', borderTopColor: 'transparent' }}></div>
           <p className="text-sm" style={{ color: 'var(--text-4)' }}>Indexing game containers...</p>
-          <p className="text-xs mt-1" style={{ color: 'var(--text-4)' }}>First run reads the asset type of every package and takes about half a minute; afterwards only containers a game update changed are read again</p>
+          <p className="text-xs mt-1" style={{ color: 'var(--text-4)' }}>First run reads the asset type of every package and takes about half a minute; afterwards cached index is instant.</p>
         </div>
       ) : error ? (
         <div className="flex-1 flex flex-col items-center justify-center gap-3 p-6">
@@ -361,7 +497,6 @@ export function ManualExtractionPage({ onClose, onExtract, addDebugLog }: Manual
         </div>
       ) : (
         <div className="flex-1 flex min-h-0">
-
           {/* Browser */}
           <div className="flex-1 flex flex-col min-h-0 border-r" style={{ borderColor: 'var(--bg-2)' }}>
             <div className="p-3 border-b flex items-center gap-2 flex-shrink-0" style={{ borderColor: 'var(--bg-2)' }}>
@@ -381,88 +516,129 @@ export function ManualExtractionPage({ onClose, onExtract, addDebugLog }: Manual
                   className="px-3 py-2 text-xs font-semibold whitespace-nowrap"
                   style={{ backgroundColor: 'var(--bg-1)', color: 'var(--accent-main)' }}
                 >
-                  Queue all results
+                  Queue all ({Math.min(searchResults.length, MAX_SEARCH_RESULTS)}) results
                 </button>
               )}
             </div>
 
-            <div className="flex-1 overflow-auto" style={{ minHeight: 0 }}>
-              {searchResults ? (
-                searchResults.length === 0 ? (
-                  <p className="p-4 text-sm" style={{ color: 'var(--text-4)' }}>No material instances match that search.</p>
-                ) : (
-                  <>
-                    {searchResults.slice(0, MAX_SEARCH_RESULTS).map((path, i) => {
-                      const name = path.split('/').pop() || path;
-                      const queued = queueSet.has(path);
-                      return (
-                        <div
-                          key={path}
-                          onClick={() => toggleFile(path)}
-                          className={`flex items-center gap-2 px-3 py-1 cursor-pointer text-sm ${i % 2 === 1 ? STRIPE_CLASS : ROW_CLASS}`}
-                          style={{ color: queued ? 'var(--accent-main)' : 'var(--text-3)' }}
-                        >
-                          <QueueCheckbox checked={queued} />
-                          <span className="truncate font-medium">{name.replace(/\.uasset$/, '')}</span>
-                          <span className="truncate text-xs ml-auto pl-3" style={{ color: 'var(--text-4)' }}>{displayPath(path)}</span>
-                        </div>
-                      );
-                    })}
-                    {searchResults.length > MAX_SEARCH_RESULTS && (
-                      <p className="p-3 text-xs" style={{ color: 'var(--text-4)' }}>
-                        Showing the first {MAX_SEARCH_RESULTS} matches — narrow the search to see more.
-                      </p>
-                    )}
-                  </>
-                )
+            {searchResults ? (
+              searchResults.length === 0 ? (
+                <div className="p-4 text-sm" style={{ color: 'var(--text-4)' }}>No material instances match that search.</div>
               ) : (
-                (() => {
-                  const row = { i: 0 };
-                  return Array.from(tree.dirs.values()).map(dir => renderFolder(dir, 0, row));
-                })()
-              )}
-            </div>
+                <div
+                  ref={searchContainerRef}
+                  onScroll={(e) => setSearchScrollTop(e.currentTarget.scrollTop)}
+                  className="flex-1 overflow-auto"
+                  style={{ minHeight: 0 }}
+                >
+                  <div style={{ height: searchTotalHeight, position: 'relative' }}>
+                    <div style={{ position: 'absolute', top: 0, left: 0, right: 0, transform: `translateY(${searchOffsetY}px)` }}>
+                      {visibleSearchResults.map((path, idx) => {
+                        const actualIdx = searchStartIndex + idx;
+                        const name = path.split('/').pop() || path;
+                        const queued = queueSet.has(path);
+                        const striped = actualIdx % 2 === 1;
+                        return (
+                          <div
+                            key={path}
+                            onClick={() => toggleFile(path)}
+                            className={`flex items-center gap-2 px-3 cursor-pointer text-sm ${striped ? STRIPE_CLASS : ROW_CLASS}`}
+                            style={{
+                              color: queued ? 'var(--accent-main)' : 'var(--text-3)',
+                              height: `${ROW_HEIGHT}px`,
+                              boxSizing: 'border-box',
+                            }}
+                          >
+                            <QueueCheckbox checked={queued} />
+                            <span className="truncate font-medium font-mono text-xs">{name.replace(/\.uasset$/, '')}</span>
+                            <span className="truncate text-xs ml-auto pl-3 font-mono" style={{ color: 'var(--text-4)' }}>{displayPath(path)}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )
+            ) : (
+              <div
+                ref={treeContainerRef}
+                onScroll={(e) => setTreeScrollTop(e.currentTarget.scrollTop)}
+                className="flex-1 overflow-auto"
+                style={{ minHeight: 0 }}
+              >
+                <div style={{ height: treeTotalHeight, position: 'relative' }}>
+                  <div style={{ position: 'absolute', top: 0, left: 0, right: 0, transform: `translateY(${treeOffsetY}px)` }}>
+                    {visibleTreeRows.map((item, idx) => {
+                      const actualIdx = treeStartIndex + idx;
+                      const striped = actualIdx % 2 === 1;
+                      if (item.type === 'dir') {
+                        return renderFolderRow(item.node, item.depth, striped);
+                      } else {
+                        return renderFileRow(item.name, item.path, item.depth, striped);
+                      }
+                    })}
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* Queue */}
+          {/* Queue Sidebar */}
           <div className="flex flex-col min-h-0 flex-shrink-0" style={{ width: 380 }}>
             <div className="p-3 border-b flex items-center justify-between flex-shrink-0" style={{ borderColor: 'var(--bg-2)' }}>
               <h3 className="text-sm font-bold" style={{ color: 'var(--text-2)' }}>
-                Extraction Queue <span style={{ color: 'var(--accent-main)' }}>({queue.length})</span>
+                Extraction Queue <span style={{ color: 'var(--accent-main)' }}>({queue.length.toLocaleString()})</span>
               </h3>
               {queue.length > 0 && (
-                <button onClick={() => setQueue([])} className="text-xs font-semibold" style={{ color: 'var(--text-4)' }}>
+                <button onClick={() => setQueue([])} className="text-xs font-semibold hover:underline" style={{ color: 'var(--text-4)' }}>
                   Clear
                 </button>
               )}
             </div>
 
-            <div className="flex-1 overflow-auto" style={{ minHeight: 0 }}>
-              {queue.length === 0 ? (
-                <p className="p-4 text-sm" style={{ color: 'var(--text-4)' }}>
-                  Nothing queued yet. Click a material instance to add it, or tick a folder to queue everything inside it.
-                </p>
-              ) : (
-                queue.map((path, i) => (
-                  <div
-                    key={path}
-                    className={`flex items-center gap-2 px-3 py-1 text-sm group/queue ${i % 2 === 1 ? STRIPE_CLASS : ROW_CLASS}`}
-                    style={{ color: 'var(--text-3)' }}
-                    title={displayPath(path)}
-                  >
-                    <span className="truncate flex-1">{(path.split('/').pop() || path).replace(/\.uasset$/, '')}</span>
-                    <button
-                      onClick={() => toggleFile(path)}
-                      className="opacity-0 group-hover/queue:opacity-100 transition-opacity flex-shrink-0"
-                      style={{ color: 'var(--text-4)' }}
-                      title="Remove from queue"
-                    >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
-                    </button>
+            {queue.length === 0 ? (
+              <div className="flex-1 p-4 text-sm" style={{ color: 'var(--text-4)' }}>
+                Nothing queued yet. Click a material instance to add it, or tick a folder to queue everything inside it.
+              </div>
+            ) : (
+              <div
+                ref={queueContainerRef}
+                onScroll={(e) => setQueueScrollTop(e.currentTarget.scrollTop)}
+                className="flex-1 overflow-auto"
+                style={{ minHeight: 0 }}
+              >
+                <div style={{ height: queueTotalHeight, position: 'relative' }}>
+                  <div style={{ position: 'absolute', top: 0, left: 0, right: 0, transform: `translateY(${queueOffsetY}px)` }}>
+                    {visibleQueueRows.map((path, idx) => {
+                      const actualIdx = queueStartIndex + idx;
+                      const striped = actualIdx % 2 === 1;
+                      return (
+                        <div
+                          key={path}
+                          className={`flex items-center gap-2 px-3 text-sm group/queue ${striped ? STRIPE_CLASS : ROW_CLASS}`}
+                          style={{
+                            color: 'var(--text-3)',
+                            height: `${ROW_HEIGHT}px`,
+                            boxSizing: 'border-box',
+                          }}
+                          title={displayPath(path)}
+                        >
+                          <span className="truncate flex-1 font-mono text-xs">{(path.split('/').pop() || path).replace(/\.uasset$/, '')}</span>
+                          <button
+                            onClick={() => toggleFile(path)}
+                            className="opacity-0 group-hover/queue:opacity-100 transition-opacity flex-shrink-0 p-1 hover:text-white"
+                            style={{ color: 'var(--text-4)' }}
+                            title="Remove from queue"
+                          >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
-                ))
-              )}
-            </div>
+                </div>
+              </div>
+            )}
 
             <div className="p-3 border-t flex flex-col gap-3 flex-shrink-0" style={{ borderColor: 'var(--bg-2)' }}>
               <button
@@ -474,7 +650,7 @@ export function ManualExtractionPage({ onClose, onExtract, addDebugLog }: Manual
                   color: queue.length === 0 ? 'var(--text-4)' : 'var(--bg-4)',
                 }}
               >
-                Extract &amp; Import {queue.length > 0 ? `(${queue.length})` : ''}
+                Extract &amp; Import {queue.length > 0 ? `(${queue.length.toLocaleString()})` : ''}
               </button>
             </div>
           </div>

@@ -7,6 +7,7 @@ interface HeaderProps {
   onOpenSettings: () => void;
   onOpenFilterSettings: () => void;
   onOpenVfxUpdater?: () => void;
+  onOpenConsole?: () => void;
   onCloseProject?: () => void;
   onReset: () => void;
   addDebugLog: (msg: string) => void;
@@ -20,6 +21,7 @@ export function Header({
   onOpenSettings,
   onOpenFilterSettings,
   onOpenVfxUpdater,
+  onOpenConsole,
   onCloseProject,
   onReset,
   addDebugLog,
@@ -39,50 +41,18 @@ export function Header({
 
   return (
     <header
-      className="relative flex items-center justify-between px-4 h-13 border-2 transition-all duration-150 select-none shadow-md"
+      className="relative flex items-center justify-between px-4 h-12 border-2 transition-all duration-150 select-none shadow-md"
       style={{
         backgroundColor: 'var(--bg-3)',
         borderColor: 'var(--bg-2)',
-        height: '50px',
-        minHeight: '50px',
+        height: '48px',
+        minHeight: '48px',
       }}
     >
-      {/* Left: Branding & Version */}
+      {/* Left: Active Workspace / Navigation */}
       <div className="flex items-center gap-3">
-        <img
-          src="./assets/saturn-logo.svg"
-          alt="Saturn Logo"
-          className="h-6 w-6 filter brightness-0 invert opacity-90 transition-transform hover:scale-110"
-        />
-        <div className="flex items-baseline gap-2">
-          <span
-            className="text-sm font-bold tracking-wider uppercase font-sans leading-none"
-            style={{ color: 'var(--text-1)' }}
-          >
-            Rivals VFX Editor
-          </span>
-          <span
-            className="text-[10px] font-mono font-medium px-1.5 py-0.5 rounded border border-gray-700/60 leading-none"
-            style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-4)' }}
-          >
-            v3.5.0
-          </span>
-        </div>
-      </div>
-
-      {/* Center: Context & Back to Menu Navigation */}
-      <div className="flex items-center gap-3">
-        {isProjectActive && (
+        {isProjectActive ? (
           <div className="flex items-center gap-2">
-            {projectTitle && (
-              <span
-                className="hidden sm:inline-block text-xs font-mono px-2 py-0.5 rounded border border-gray-700/50 max-w-[200px] truncate"
-                style={{ backgroundColor: 'var(--bg-2)', color: 'var(--text-2)' }}
-                title={projectTitle}
-              >
-                {projectTitle}
-              </span>
-            )}
             <button
               type="button"
               onClick={handleResetClick}
@@ -99,17 +69,54 @@ export function Header({
               </svg>
               <span>Back to Menu</span>
             </button>
+            {projectTitle && (
+              <span
+                className="hidden sm:inline-block text-xs font-mono px-2 py-0.5 rounded border border-gray-700/50 max-w-[260px] truncate"
+                style={{ backgroundColor: 'var(--bg-2)', color: 'var(--text-2)' }}
+                title={projectTitle}
+              >
+                {projectTitle}
+              </span>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-emerald-500" />
+            <span className="text-xs font-mono font-medium tracking-wide uppercase" style={{ color: 'var(--text-3)' }}>
+              Workspace Ready
+            </span>
           </div>
         )}
       </div>
 
-      {/* Right: Quick Action Icons */}
-      <div className="flex items-center gap-1.5">
+      {/* Right: Quick Action Controls & Console */}
+      <div className="flex items-center gap-2">
+        {/* Prominent Live Console / Telemetry Logs Button */}
+        {onOpenConsole && (
+          <button
+            type="button"
+            onClick={onOpenConsole}
+            title="Open Live Diagnostic Console & Telemetry"
+            className="flex items-center gap-1.5 px-3 py-1 text-xs font-mono font-bold rounded border transition-all hover:brightness-125 hover:shadow"
+            style={{
+              backgroundColor: 'rgba(16, 185, 129, 0.12)',
+              borderColor: 'rgba(16, 185, 129, 0.4)',
+              color: '#34d399',
+            }}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="4 17 10 11 4 5" />
+              <line x1="12" y1="19" x2="20" y2="19" />
+            </svg>
+            <span>Console / Logs</span>
+          </button>
+        )}
+
         {/* VFX Updater Tool */}
         {onOpenVfxUpdater && (
           <button
             type="button"
-            title="Repak VFX Mod Updater"
+            title="VFX Updater"
             onClick={onOpenVfxUpdater}
             className="p-1.5 rounded transition-colors hover:bg-white/10"
             style={{ color: '#60a5fa' }}

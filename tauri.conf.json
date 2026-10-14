@@ -19,7 +19,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Rivals VFX Editor",
+        "title": "Rivals VFX Editor v3.5.0",
         "width": 1440,
         "height": 920,
         "dragDropEnabled": true,

@@ -39,6 +39,18 @@ export interface AppSettings {
   filterDictionary?: FilterDictionary;
   isHeaderMinimized?: boolean;
   pakReadyStructure?: boolean;
+  enableTelemetry?: boolean;
+}
+
+// ===== Telemetry Snapshot =====
+export interface TelemetrySnapshot {
+  total_ram_mb: number;
+  used_ram_mb: number;
+  available_ram_mb: number;
+  ram_percent: number;
+  app_ram_mb: number;
+  cpu_percent: number;
+  timestamp: string;
 }
 
 // ===== Cache Info =====
@@ -172,6 +184,7 @@ export interface RvfxpSlot {
   customLabel: string;
   bundleGroup?: string;
   recipe?: RvfxpRecipe;
+  sessionData?: SessionEntry[];
   targetSubpaths?: string[];
 }
 
@@ -179,6 +192,7 @@ export interface RvfxpPresetV2 {
   version: 2;
   generator: 'RivalsVFXEditor';
   timestamp: string;
+  isWorkspaceProfile?: boolean;
   recipe: RvfxpRecipe;
   slots: RvfxpSlot[];
   manualOverrides?: SessionEntry[];

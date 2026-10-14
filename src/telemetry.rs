@@ -1,8 +1,9 @@
 //! Diagnostic Telemetry & Persistent Disk Logger
 //!
 //! Provides persistent file logging next to the executable (in `Logs/`),
-//! an in-memory ring buffer for the in-app live console, and zero-dependency
-//! native Windows RAM and CPU utilization sampling.
+//! an in-memory ring buffer for the in-app live console, zero-dependency
+//! native Windows RAM and CPU utilization sampling, a dedicated background
+//! monitoring daemon thread, and a global crash panic hook.
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ static TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(true);
 static LOG_BUFFER: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
+static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
 const MAX_IN_MEMORY_LOGS: usize = 2000;
 
@@ -105,7 +107,7 @@ pub fn is_telemetry_enabled() -> bool {
     TELEMETRY_ENABLED.load(Ordering::SeqCst)
 }
 
-/// Resolves or initializes the `Logs/` directory next to the executable or in the current working directory.
+/// Resolves or initializes the `Logs/` directory next to the executable or in current working directory.
 pub fn get_log_dir() -> PathBuf {
     LOG_DIR
         .get_or_init(|| {
@@ -119,6 +121,85 @@ pub fn get_log_dir() -> PathBuf {
             logs_path
         })
         .clone()
+}
+
+/// Registers a global Rust panic hook to capture critical crashes and backtraces to disk.
+pub fn setup_panic_hook() {
+    let old_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let backtrace = std::backtrace::Backtrace::capture();
+        let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic payload".to_string()
+        };
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+
+        let crash_msg = format!(
+            "CRITICAL RUST PANIC at {}:\nPayload: {}\n\nStack Backtrace:\n{:?}",
+            location, payload, backtrace
+        );
+
+        log_error(&crash_msg);
+
+        // Also write dedicated crash dump file: Logs/rvfx_crash_[timestamp].log
+        let logs_dir = get_log_dir();
+        let ts = Local::now().format("%Y%m%d_%H%M%S");
+        let crash_file = logs_dir.join(format!("rvfx_crash_{}.log", ts));
+        let _ = std::fs::write(&crash_file, &crash_msg);
+        eprintln!("{}", crash_msg);
+
+        old_hook(panic_info);
+    }));
+}
+
+/// Starts a dedicated background monitoring daemon thread that checks RAM/CPU thresholds.
+pub fn start_telemetry_monitor() {
+    if MONITOR_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let _ = std::thread::Builder::new()
+        .name("rvfx-telemetry-daemon".to_string())
+        .spawn(move || {
+            let mut tick: u64 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if !is_telemetry_enabled() {
+                    continue;
+                }
+
+                tick = tick.wrapping_add(1);
+                let snap = sample_telemetry();
+
+                // 1. High Memory Pressure Alerts (App RAM > 800 MB or System RAM > 85%)
+                if snap.app_ram_mb >= 800 || snap.ram_percent >= 85.0 {
+                    log_warn(format!(
+                        "HIGH MEMORY PRESSURE ALERT: App RAM: {} MB | System RAM: {:.1}/{:.1} GB ({}%) | CPU: {:.0}%",
+                        snap.app_ram_mb,
+                        snap.used_ram_mb as f64 / 1024.0,
+                        snap.total_ram_mb as f64 / 1024.0,
+                        snap.ram_percent as u32,
+                        snap.cpu_percent
+                    ));
+                } else if tick % 15 == 0 {
+                    // 2. Periodic Heartbeat every ~30 seconds
+                    log_info(format!(
+                        "Heartbeat: App RAM: {} MB | System RAM: {:.1}/{:.1} GB ({}%) | CPU: {:.0}%",
+                        snap.app_ram_mb,
+                        snap.used_ram_mb as f64 / 1024.0,
+                        snap.total_ram_mb as f64 / 1024.0,
+                        snap.ram_percent as u32,
+                        snap.cpu_percent
+                    ));
+                }
+            }
+        });
 }
 
 /// Initialize the persistent logger on application start.
@@ -137,6 +218,9 @@ pub fn init_logger() {
 
     LOG_FILE.get_or_init(|| Mutex::new(file_opt));
     LOG_BUFFER.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_IN_MEMORY_LOGS)));
+
+    setup_panic_hook();
+    start_telemetry_monitor();
 
     log_info(format!(
         "Diagnostic Telemetry Logger initialized. Log directory: {}",
@@ -285,7 +369,7 @@ pub fn log_with_level(level: &str, msg: impl AsRef<str>) {
         }
     }
 
-    // Write to persistent log file on disk
+    // Write to persistent log file on disk and flush immediately
     if let Some(file_mutex) = LOG_FILE.get() {
         if let Ok(mut file_opt) = file_mutex.lock() {
             if let Some(ref mut file) = *file_opt {

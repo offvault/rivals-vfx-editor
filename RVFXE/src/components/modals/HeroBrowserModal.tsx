@@ -72,20 +72,29 @@ export function HeroBrowserModal({ onClose, onSelectHero, onBatchLoadHeroes, add
         console.error('[HeroBrowser] Batch extraction failed:', err);
       }
 
-      const fetchPromises = uncachedHeroes.map(async (hero) => {
-        try {
-          const dataUrl = await tauri.getHeroIconDataUrl(hero.hero_id);
-          if (dataUrl) {
-            iconDataUrlCache[hero.hero_id] = dataUrl;
-            iconLoadedGlobal.add(hero.hero_id);
-            setIconDataUrls(prev => ({ ...prev, [hero.hero_id]: dataUrl }));
-          }
-        } catch (err) {
-          console.debug(`[HeroBrowser] Icon data URL failed for ${hero.hero_id}:`, err);
+      // Fetch data URLs in small chunks of 6 to prevent IPC flooding and V8 memory spikes
+      for (let i = 0; i < uncachedHeroes.length; i += 6) {
+        const chunk = uncachedHeroes.slice(i, i + 6);
+        const chunkResults: Record<string, string> = {};
+        await Promise.all(
+          chunk.map(async (hero) => {
+            try {
+              const dataUrl = await tauri.getHeroIconDataUrl(hero.hero_id);
+              if (dataUrl) {
+                iconDataUrlCache[hero.hero_id] = dataUrl;
+                iconLoadedGlobal.add(hero.hero_id);
+                chunkResults[hero.hero_id] = dataUrl;
+              }
+            } catch (err) {
+              console.debug(`[HeroBrowser] Icon data URL failed for ${hero.hero_id}:`, err);
+            }
+          })
+        );
+        if (Object.keys(chunkResults).length > 0) {
+          setIconDataUrls(prev => ({ ...prev, ...chunkResults }));
         }
-      });
-
-      await Promise.all(fetchPromises);
+        await new Promise(r => setTimeout(r, 10));
+      }
       setLoadingIcons(false);
     };
 

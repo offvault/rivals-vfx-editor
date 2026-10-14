@@ -26,3 +26,5 @@ Thumbs.db
 /docs/
 *.tsbuildinfo
 repomix-output.xml
+Logs/
+*.log

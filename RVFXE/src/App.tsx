@@ -265,50 +265,60 @@ export function App() {
     koMode: boolean,
     forceRefresh = false
   ): Promise<{
-    fileObjs: FileObject[];
     srcMap: Record<string, { uassetPath: string; jsonPath: string }>;
     params: ColorParam[];
     originalFiles: Record<string, any>;
   }> => {
     const res = await tauri.extractHeroVfx(heroId, koMode, forceRefresh);
-    const fileObjs: FileObject[] = [];
     const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
+    const freshParams: ColorParam[] = [];
+    const freshFiles: Record<string, any> = {};
 
-    for (let j = 0; j < res.json_paths.length; j++) {
+    const totalFiles = res.json_paths.length;
+    tauri.logFrontendMessage('INFO', `[Hero ${heroId}] Parsing ${totalFiles} material JSONs...`).catch(() => {});
+
+    for (let j = 0; j < totalFiles; j++) {
       const jsonPath = res.json_paths[j];
       const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
       const uassetPath = res.uasset_paths[j] || '';
+      const parts = jsonPath.replace(/\\/g, '/').split('/');
+      const customIdx = parts.findIndex(p => p === 'Custom');
+      const charsIdx = parts.findIndex(p => p === 'Characters');
+      let relativePath = '';
+      if (customIdx >= 0) {
+        relativePath = parts.slice(customIdx + 1).join('/');
+      } else if (charsIdx >= 0) {
+        const heroIdx = parts.indexOf(heroId, charsIdx + 1);
+        relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
+      } else {
+        const heroIdx = parts.lastIndexOf(heroId);
+        relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
+      }
+      srcMap[relativePath] = { uassetPath, jsonPath };
+
       try {
         const content = await tauri.readTextFile(jsonPath);
-        const parts = jsonPath.replace(/\\/g, '/').split('/');
-        const customIdx = parts.findIndex(p => p === 'Custom');
-        const charsIdx = parts.findIndex(p => p === 'Characters');
-        let relativePath = '';
-        if (customIdx >= 0) {
-          relativePath = parts.slice(customIdx + 1).join('/');
-        } else if (charsIdx >= 0) {
-          const heroIdx = parts.indexOf(heroId, charsIdx + 1);
-          relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
-        } else {
-          const heroIdx = parts.lastIndexOf(heroId);
-          relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
+        const json = JSON.parse(content);
+        const beforeCount = freshParams.length;
+        parseJsonAndExtractColors(json, fileName, relativePath, freshParams, filterDictionary, debug.addLog);
+        if (freshParams.length > beforeCount) {
+          // Retain JSON AST only if this file actually has editable colors
+          freshFiles[relativePath] = json;
         }
-        fileObjs.push({ name: fileName, content, relativePath });
-        srcMap[relativePath] = { uassetPath, jsonPath };
       } catch (e) {}
+
+      // Yield every 30 files so V8 can run incremental GC and prevent memory spikes
+      if (j > 0 && j % 30 === 0) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
     }
 
-    const freshParams: ColorParam[] = [];
-    const freshFiles: Record<string, any> = {};
-    fileObjs.forEach(f => {
-      try {
-        const json = JSON.parse(f.content);
-        freshFiles[f.relativePath] = json;
-        parseJsonAndExtractColors(json, f.name, f.relativePath, freshParams, filterDictionary, debug.addLog);
-      } catch (e) {}
-    });
+    tauri.logFrontendMessage(
+      'INFO',
+      `[Hero ${heroId}] Done parsing: ${freshParams.length} color params in ${Object.keys(freshFiles).length}/${totalFiles} files`
+    ).catch(() => {});
 
-    return { fileObjs, srcMap, params: freshParams, originalFiles: freshFiles };
+    return { srcMap, params: freshParams, originalFiles: freshFiles };
   }, [filterDictionary, debug.addLog]);
 
   // === COLOR ACTIONS ===
@@ -696,10 +706,10 @@ export function App() {
     try {
       // Find all distinct hero IDs in the queue
       const uniqueHeroIds = [...new Set(slots.map(s => s.heroId))];
+      tauri.logFrontendMessage('INFO', `Starting batch extraction: ${uniqueHeroIds.length} heroes across ${slots.length} slots`).catch(() => {});
       debug.addLog(`Beginning up-front extraction for ${uniqueHeroIds.length} heroes across ${slots.length} slots...`);
 
       const rawExtractedMap: Record<string, {
-        fileObjs: FileObject[];
         srcMap: Record<string, { uassetPath: string; jsonPath: string }>;
         params: ColorParam[];
         originalFiles: Record<string, any>;
@@ -715,6 +725,9 @@ export function App() {
 
         const data = await fetchHeroVfxData(hId, koMode, forceRefresh);
         rawExtractedMap[hId] = data;
+
+        // Yield to the V8 event loop between heroes to let garbage collection reclaim memory
+        await new Promise(resolve => setTimeout(resolve, 60));
       }
 
       // Initialize each slot with its own isolated memory copy
@@ -894,9 +907,15 @@ export function App() {
         for (const k of uassetKeys) {
           if (originalFiles[k]) modifiedFiles[k] = structuredClone(originalFiles[k]);
         }
-        colorParams.forEach(p => {
+        for (const p of colorParams) {
+          if (!modifiedFiles[p.relativePath] && uassetSourceMap[p.relativePath]?.jsonPath) {
+            try {
+              const content = await tauri.readTextFile(uassetSourceMap[p.relativePath].jsonPath);
+              modifiedFiles[p.relativePath] = JSON.parse(content);
+            } catch (e) {}
+          }
           if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
-        });
+        }
 
         // 1. JSON Dumps if requested
         if (options.exportJson) {
@@ -1013,12 +1032,20 @@ export function App() {
           });
 
           const modifiedFiles: Record<string, any> = {};
-          for (const k of Object.keys(slot.originalFiles)) {
-            modifiedFiles[k] = structuredClone(slot.originalFiles[k]);
+          if (slot.originalFiles) {
+            for (const k of Object.keys(slot.originalFiles)) {
+              modifiedFiles[k] = structuredClone(slot.originalFiles[k]);
+            }
           }
-          slot.colorParams.forEach(p => {
+          for (const p of slot.colorParams) {
+            if (!modifiedFiles[p.relativePath] && slot.uassetSourceMap[p.relativePath]?.jsonPath) {
+              try {
+                const content = await tauri.readTextFile(slot.uassetSourceMap[p.relativePath].jsonPath);
+                modifiedFiles[p.relativePath] = JSON.parse(content);
+              } catch (e) {}
+            }
             if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
-          });
+          }
 
           // 1. JSON Dumps if requested
           if (options.exportJson) {

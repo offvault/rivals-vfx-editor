@@ -7,33 +7,25 @@ import type { ColorParam, FilterDictionary } from '@/types';
 /**
  * Check if a parameter name matches the filter dictionary rules.
  */
-export function paramMatchesFilter(paramName: string, filterDictionary: FilterDictionary): boolean {
-  if (!filterDictionary) return false;
+export function paramMatchesFilter(
+  paramName: string,
+  filterDictionary: FilterDictionary,
+  isExplicitVectorParam = false
+): boolean {
+  if (!filterDictionary) return true;
 
   const paramNameLower = (paramName || '').toLowerCase();
-  const includeKeywords = (filterDictionary.include_keywords || []).map(k => String(k).toLowerCase());
   const excludeKeywords = (filterDictionary.exclude_keywords || []).map(k => String(k).toLowerCase());
+  const hasExcludedKeyword = excludeKeywords.some(keyword => keyword && paramNameLower.includes(keyword));
+  if (hasExcludedKeyword) return false;
 
-  // include requires at least one include keyword (if include list empty => allow all)
-  const hasIncludeKeyword = includeKeywords.length === 0
-    ? true
-    : includeKeywords.some(keyword => paramNameLower.includes(keyword));
+  // VectorParameterValues are explicitly exposed by material shader designers for tinting/coloring
+  if (isExplicitVectorParam) return true;
 
-  // substring exclusions (JSON-driven)
-  const hasExcludedKeyword = excludeKeywords.some(keyword => paramNameLower.includes(keyword));
+  const includeKeywords = (filterDictionary.include_keywords || []).map(k => String(k).toLowerCase());
+  if (includeKeywords.length === 0) return true;
 
-  // debug: show why a param is rejected
-  if (!hasIncludeKeyword || hasExcludedKeyword) {
-    console.debug('[paramMatchesFilter] excluded', {
-      paramName,
-      hasIncludeKeyword,
-      hasExcludedKeyword,
-      includeKeywords,
-      excludeKeywords,
-    });
-  }
-
-  return hasIncludeKeyword && !hasExcludedKeyword;
+  return includeKeywords.some(keyword => keyword && paramNameLower.includes(keyword));
 }
 
 /**
@@ -62,38 +54,66 @@ function findColorsRecursive(
 ): void {
   if (!currentObject || typeof currentObject !== 'object') return;
 
-  const colorNames = getColorPropertyNames(filterDictionary);
-  const isColorProperty = colorNames.includes(currentObject.Name) && currentObject.StructType === 'LinearColor';
-  const colorValue = currentObject?.Value?.[0]?.Value;
+  // Check 1: StructPropertyData of type LinearColor or Color
+  const isLinearColorStruct =
+    (currentObject.StructType === 'LinearColor' || currentObject.StructType === 'Color') &&
+    currentObject.Value &&
+    Array.isArray(currentObject.Value);
 
-  if (isColorProperty && colorValue && typeof colorValue.R !== 'undefined') {
-    const paramName = `${parentName} - ${currentObject.Name}`;
-
-    if (!paramMatchesFilter(paramName, filterDictionary)) return;
-
-    const id = `${relativePath}-${parentName}-${currentObject.Name}-${allParams.length}`;
-    const path = [...currentPath, 'Value', 0, 'Value'];
-
-    const sanitizedRgba = {
-      R: parseFloat(colorValue.R) || 0,
-      G: parseFloat(colorValue.G) || 0,
-      B: parseFloat(colorValue.B) || 0,
-      A: parseFloat(colorValue.A) || 0,
-    };
-
-    allParams.push({ id, fileName, paramName, path, rgba: sanitizedRgba, relativePath });
-    console.debug('[findColorsRecursive] Found color:', paramName, sanitizedRgba);
-  } else {
-    if (Array.isArray(currentObject)) {
-      currentObject.forEach((item, index) => {
-        findColorsRecursive(item, [...currentPath, index], fileName, parentName, allParams, relativePath, filterDictionary);
-      });
-    } else {
-      for (const key in currentObject) {
-        if (Object.prototype.hasOwnProperty.call(currentObject, key)) {
-          findColorsRecursive(currentObject[key], [...currentPath, key], fileName, parentName, allParams, relativePath, filterDictionary);
-        }
+  if (isLinearColorStruct) {
+    const colorValue = currentObject.Value[0]?.Value || currentObject.Value[0];
+    if (colorValue && typeof colorValue.R !== 'undefined') {
+      const propName = currentObject.Name || 'Color';
+      const paramName = `${parentName} - ${propName}`;
+      if (paramMatchesFilter(paramName, filterDictionary, false)) {
+        const id = `${relativePath}-${parentName}-${propName}-${allParams.length}`;
+        const valPath = currentObject.Value[0]?.Value
+          ? [...currentPath, 'Value', 0, 'Value']
+          : [...currentPath, 'Value', 0];
+        const sanitizedRgba = {
+          R: parseFloat(colorValue.R) || 0,
+          G: parseFloat(colorValue.G) || 0,
+          B: parseFloat(colorValue.B) || 0,
+          A: parseFloat(colorValue.A) || 0,
+        };
+        allParams.push({ id, fileName, paramName, path: valPath, rgba: sanitizedRgba, relativePath });
+        return;
       }
+    }
+  }
+
+  // Check 2: Direct property matching known color names
+  const colorNames = getColorPropertyNames(filterDictionary);
+  if (
+    colorNames.includes(currentObject.Name) &&
+    currentObject.Value &&
+    typeof currentObject.Value.R !== 'undefined'
+  ) {
+    const propName = currentObject.Name;
+    const paramName = `${parentName} - ${propName}`;
+    if (paramMatchesFilter(paramName, filterDictionary, false)) {
+      const id = `${relativePath}-${parentName}-${propName}-${allParams.length}`;
+      const valPath = [...currentPath, 'Value'];
+      const sanitizedRgba = {
+        R: parseFloat(currentObject.Value.R) || 0,
+        G: parseFloat(currentObject.Value.G) || 0,
+        B: parseFloat(currentObject.Value.B) || 0,
+        A: parseFloat(currentObject.Value.A) || 0,
+      };
+      allParams.push({ id, fileName, paramName, path: valPath, rgba: sanitizedRgba, relativePath });
+      return;
+    }
+  }
+
+  // Recurse into children
+  if (Array.isArray(currentObject)) {
+    currentObject.forEach((item, index) => {
+      findColorsRecursive(item, [...currentPath, index], fileName, parentName, allParams, relativePath, filterDictionary);
+    });
+  } else {
+    for (const key of Object.keys(currentObject)) {
+      if (key === 'RawData' || key === 'BulkData' || key === 'Bytes') continue;
+      findColorsRecursive(currentObject[key], [...currentPath, key], fileName, parentName, allParams, relativePath, filterDictionary);
     }
   }
 }
@@ -110,88 +130,79 @@ export function parseJsonAndExtractColors(
   filterDictionary: FilterDictionary,
   addDebugLog: (msg: string) => void
 ): void {
-  const firstExport = Array.isArray(json?.Exports) ? json.Exports[0] : null;
-  const firstExportData = firstExport?.Data;
-
-  if (typeof firstExportData === 'string') {
-    console.warn(`Unsupported RawExport JSON for color extraction: ${fileName}`, {
-      relativePath,
-      exportType: firstExport?.$type,
-      objectName: firstExport?.ObjectName,
-    });
-    addDebugLog(`Unsupported RawExport JSON: ${fileName} (${firstExport?.ObjectName || 'unknown export'})`);
+  if (!json || !Array.isArray(json.Exports)) {
     return;
   }
 
-  // FORMAT TYPE 1: VFX Material File (original format)
-  const vectorParamsArray = Array.isArray(firstExportData)
-    ? firstExportData.find((p: any) => p.Name === 'VectorParameterValues')
-    : null;
+  json.Exports.forEach((exportItem: any, exportIndex: number) => {
+    if (typeof exportItem?.Data === 'string') {
+      console.warn(`Skipping RawExport in export ${exportIndex} for ${fileName}`);
+      return;
+    }
 
-  if (vectorParamsArray && vectorParamsArray.Value) {
-    vectorParamsArray.Value.forEach((param: any, paramIndex: number) => {
-      const paramInfo = param?.Value?.find((p: any) => p.Name === 'ParameterInfo');
-      const paramName = paramInfo?.Value?.find((p: any) => p.Name === 'Name')?.Value;
+    const exportData = exportItem?.Data;
+    const parentName = exportItem?.ObjectName || `Export_${exportIndex}`;
 
-      if (paramName) {
-        if (!paramMatchesFilter(paramName, filterDictionary)) return;
+    // FORMAT TYPE 1: Check for VectorParameterValues anywhere in export Data
+    if (Array.isArray(exportData)) {
+      const vectorParamIndex = exportData.findIndex((p: any) => p.Name === 'VectorParameterValues');
+      if (vectorParamIndex !== -1) {
+        const vectorParamsArray = exportData[vectorParamIndex];
+        if (Array.isArray(vectorParamsArray?.Value)) {
+          vectorParamsArray.Value.forEach((param: any, paramIndex: number) => {
+            const paramInfo = param?.Value?.find((p: any) => p.Name === 'ParameterInfo');
+            const paramName = paramInfo?.Value?.find((p: any) => p.Name === 'Name')?.Value;
 
-        const paramValueObj = param?.Value?.find((p: any) => p.Name === 'ParameterValue');
-        const linearColor = paramValueObj?.Value?.find((p: any) => p.Name === 'ParameterValue')?.Value;
+            if (paramName) {
+              if (!paramMatchesFilter(paramName, filterDictionary, true)) return;
 
-        if (linearColor) {
-          const id = `${relativePath}-${paramName}-${paramIndex}`;
-          const vectorParamIndex = firstExportData.findIndex((p: any) => p.Name === 'VectorParameterValues');
-          const path: (string | number)[] = [
-            'Exports', 0, 'Data',
-            vectorParamIndex,
-            'Value', paramIndex, 'Value',
-            param.Value.findIndex((p: any) => p.Name === 'ParameterValue'),
-            'Value', 0, 'Value',
-          ];
+              const paramValueObjIndex = param?.Value?.findIndex((p: any) => p.Name === 'ParameterValue');
+              if (paramValueObjIndex !== -1) {
+                const paramValueObj = param.Value[paramValueObjIndex];
+                const linearColor = paramValueObj?.Value?.find((p: any) => p.Name === 'ParameterValue')?.Value;
 
-          const sanitizedRgba = {
-            R: parseFloat(linearColor.R) || 0,
-            G: parseFloat(linearColor.G) || 0,
-            B: parseFloat(linearColor.B) || 0,
-            A: parseFloat(linearColor.A) || 0,
-          };
+                if (linearColor && typeof linearColor.R !== 'undefined') {
+                  const id = `${relativePath}-${paramName}-${exportIndex}-${paramIndex}`;
+                  const path: (string | number)[] = [
+                    'Exports', exportIndex, 'Data',
+                    vectorParamIndex,
+                    'Value', paramIndex, 'Value',
+                    paramValueObjIndex,
+                    'Value', 0, 'Value',
+                  ];
 
-          allParams.push({ id, fileName, paramName, path, rgba: sanitizedRgba, relativePath });
+                  const sanitizedRgba = {
+                    R: parseFloat(linearColor.R) || 0,
+                    G: parseFloat(linearColor.G) || 0,
+                    B: parseFloat(linearColor.B) || 0,
+                    A: parseFloat(linearColor.A) || 0,
+                  };
+
+                  allParams.push({ id, fileName, paramName, path, rgba: sanitizedRgba, relativePath });
+                }
+              }
+            }
+          });
         }
       }
-    });
-  }
-  // FORMAT TYPE 2: RichText blueprints support
-  else if (firstExport?.$type === 'UAssetAPI.ExportTypes.DataTableExport, UAssetAPI' && firstExport?.Table?.Data) {
-    const tableData = firstExport.Table.Data;
-    const tablePath: (string | number)[] = ['Exports', 0, 'Table', 'Data'];
 
-    tableData.forEach((row: any, rowIndex: number) => {
-      if (row.StructType === 'RichTextStyleRow') {
-        const styleName = row.Name;
-        const rowPath = [...tablePath, rowIndex, 'Value'];
+      // Check remaining properties in this export's Data for any other LinearColor/Color properties
+      exportData.forEach((prop: any, propIndex: number) => {
+        if (prop.Name !== 'VectorParameterValues') {
+          findColorsRecursive(prop, ['Exports', exportIndex, 'Data', propIndex], fileName, parentName, allParams, relativePath, filterDictionary);
+        }
+      });
+    }
+
+    // FORMAT TYPE 2: DataTableExport (RichText styles, etc.)
+    if (exportItem?.$type === 'UAssetAPI.ExportTypes.DataTableExport, UAssetAPI' && Array.isArray(exportItem?.Table?.Data)) {
+      exportItem.Table.Data.forEach((row: any, rowIndex: number) => {
+        const styleName = row.Name || `Row_${rowIndex}`;
+        const rowPath = ['Exports', exportIndex, 'Table', 'Data', rowIndex, 'Value'];
         findColorsRecursive(row.Value, rowPath, fileName, styleName, allParams, relativePath, filterDictionary);
-      }
-    });
-  }
-  // FORMAT TYPE 3: Generic Blueprint support
-  else if (Array.isArray(json?.Exports)) {
-    json.Exports.forEach((exportItem: any, exportIndex: number) => {
-      if (Array.isArray(exportItem.Data)) {
-        const parentName = exportItem.ObjectName || `Export_${exportIndex}`;
-        const basePath: (string | number)[] = ['Exports', exportIndex, 'Data'];
-        findColorsRecursive(exportItem.Data, basePath, fileName, parentName, allParams, relativePath, filterDictionary);
-      } else if (typeof exportItem.Data === 'string') {
-        console.warn(`Skipping RawExport entry during generic color scan: ${fileName}`, {
-          relativePath,
-          exportIndex,
-          exportType: exportItem?.$type,
-          objectName: exportItem?.ObjectName,
-        });
-      }
-    });
-  }
+      });
+    }
+  });
 
   console.debug(`[parseJsonAndExtractColors] Extracted ${allParams.length} params from ${fileName}`);
 }

@@ -3,6 +3,7 @@ import type {
   ColorParam, RGBA, AppSettings, CacheInfo, ConversionProgress,
   FilterDictionary, SortConfig, UassetSourceMap, FileObject, SessionEntry,
   UsmapStatus, BatchHeroSlot, RvfxpPresetV2, RvfxpRecipe, QueuedPresetSlot,
+  ExportMatrixOptions, ExportSlotConfig,
 } from '@/types';
 import { useHistory } from '@/hooks/useHistory';
 import { useDebugLog } from '@/hooks/useDebugLog';
@@ -43,7 +44,10 @@ import '../css/fonts.css';
 import '../css/style.css';
 
 const DEFAULT_FILTER_DICTIONARY: FilterDictionary = {
-  include_keywords: ['color', 'tint', 'Enemy', 'Emiss', 'Diff', 'XKTex3_Col'],
+  include_keywords: [
+    'color', 'tint', 'Enemy', 'Emiss', 'Diff', 'XKTex3_Col',
+    'rgb', 'glow', 'albedo', 'fresnel', 'liquid', 'light', 'core', 'rim', 'fx', 'base',
+  ],
   exclude_keywords: ['Offset', 'uv', 'ColorMaskChannel', 'MaskColor_Enemy', 'MI_Master'],
   color_property_names: [
     'ColorAndOpacity', 'SpecifiedColor', 'BaseColor', 'HighlightColor',
@@ -864,19 +868,13 @@ export function App() {
     setShowSaveModModal(true);
   }, [batchSlots.length]);
 
-  const handleConfirmSaveMod = useCallback(async (options: {
-    targetFormat: 'iostore' | 'raw_uassets';
-    compressOodle: boolean;
-    createZip: boolean;
-    pakReady: boolean;
-    bundleName?: string;
-  }) => {
+  const handleConfirmSaveMod = useCallback(async (options: ExportMatrixOptions) => {
     try {
       const outputPath = await tauri.openDialog({
         directory: true,
         multiple: false,
         title: saveModalIsBatch
-          ? 'Select Destination Folder for All Mod Packs (e.g. Done/)'
+          ? 'Select Destination Folder for Mod Outputs (e.g. Done/)'
           : 'Select Destination Folder (e.g. Done/)',
       }) as string;
       if (!outputPath) return;
@@ -885,7 +883,8 @@ export function App() {
 
       if (!saveModalIsBatch) {
         // ===== SINGLE HERO SAVE =====
-        const cleanModFolder = sessionName.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
+        const slotConfig = options.slots[0];
+        const cleanModFolder = (slotConfig?.customLabel || sessionName).replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
         const uassetKeys = Object.keys(uassetSourceMap);
         if (uassetKeys.length === 0) { alert('No files loaded.'); return; }
 
@@ -897,6 +896,21 @@ export function App() {
           if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
         });
 
+        // 1. JSON Dumps if requested
+        if (options.exportJson) {
+          const jsonDumpDir = `${outputPath}/${cleanModFolder}/JSON`;
+          for (const keyPath of uassetKeys) {
+            if (modifiedFiles[keyPath]) {
+              const outJsonPath = `${jsonDumpDir}/${keyPath.replace(/\.uasset$/i, '.json')}`;
+              const parentDir = outJsonPath.substring(0, Math.max(outJsonPath.lastIndexOf('/'), outJsonPath.lastIndexOf('\\')));
+              await tauri.createDirectory(parentDir).catch(() => {});
+              await tauri.writeTextFile(outJsonPath, JSON.stringify(modifiedFiles[keyPath], null, 2));
+            }
+          }
+          debug.addLog(`✓ Exported JSON parameter dumps to ${jsonDumpDir}`);
+        }
+
+        // 2. Prepare JSONs for UAsset compilation
         const jsonPathsForConversion: string[] = [];
         for (const keyPath of uassetKeys) {
           const sourceInfo = uassetSourceMap[keyPath];
@@ -911,60 +925,89 @@ export function App() {
           }
         }
 
-        // Write Version 2 .rvfxp preset
+        // 3. Write Recipe .rvfxp Preset if requested
         const currentRecipe = compileCurrentRecipe();
-        const sessionData: SessionEntry[] = colorParams.map(p => ({
-          relativePath: p.relativePath.replace(/\.json$/i, ''),
-          paramName: p.paramName,
-          rgba: p.rgba,
-        }));
-        const presetV2: RvfxpPresetV2 = {
-          version: 2,
-          generator: 'RivalsVFXEditor',
-          timestamp: new Date().toISOString(),
-          recipe: currentRecipe,
-          slots: [
-            {
-              slotId: activeSlotId || 'slot_active',
-              heroId: currentHeroId || 'unknown',
-              heroName: currentHeroName || 'Unknown Hero',
-              customLabel: cleanModFolder,
-            },
-          ],
-          savedParameters: sessionData,
-        };
+        if (options.exportRvfxpPreset) {
+          const sessionData: SessionEntry[] = colorParams.map(p => ({
+            relativePath: p.relativePath.replace(/\.json$/i, ''),
+            paramName: p.paramName,
+            rgba: p.rgba,
+          }));
+          const presetV2: RvfxpPresetV2 = {
+            version: 2,
+            generator: 'RivalsVFXEditor',
+            timestamp: new Date().toISOString(),
+            recipe: currentRecipe,
+            slots: [
+              {
+                slotId: activeSlotId || 'slot_active',
+                heroId: currentHeroId || 'unknown',
+                heroName: currentHeroName || 'Unknown Hero',
+                customLabel: cleanModFolder,
+              },
+            ],
+            savedParameters: sessionData,
+          };
+          const presetPath = `${outputPath}/${cleanModFolder}.rvfxp`;
+          await tauri.writeTextFile(presetPath, JSON.stringify(presetV2, null, 2));
+          debug.addLog(`✓ Exported recipe preset to ${presetPath}`);
+        }
 
-        const presetPath = `${outputPath}/${cleanModFolder}.rvfxp`;
-        await tauri.writeTextFile(presetPath, JSON.stringify(presetV2, null, 2));
-
-        if (jsonPathsForConversion.length > 0) {
+        // 4. Raw Loose UAssets if requested
+        if (options.exportRawUassets && jsonPathsForConversion.length > 0) {
           await tauri.packageIostoreMod({
             mod_name: cleanModFolder,
             output_dir: outputPath,
             json_paths: jsonPathsForConversion,
-            target_format: options.targetFormat,
-            compress: options.compressOodle,
-            create_zip: options.createZip,
+            target_format: 'raw_uassets',
+            compress: false,
+            create_zip: false,
           });
+          debug.addLog(`✓ Exported raw loose UAssets for ${cleanModFolder}`);
+        }
+
+        // 5. Game-Ready IoStore Mod if requested
+        if (options.exportIoStore && jsonPathsForConversion.length > 0) {
+          await tauri.packageIostoreMod({
+            mod_name: cleanModFolder,
+            output_dir: outputPath,
+            json_paths: jsonPathsForConversion,
+            target_format: 'iostore',
+            compress: options.compressOodle,
+            create_zip: options.exportZip,
+          });
+          debug.addLog(`✓ Packaged IoStore mod for ${cleanModFolder}`);
         }
 
         setSaveStatus(`Saved ${cleanModFolder} successfully!`);
         await tauri.openFolder(outputPath);
-        debug.addLog(`✓ Exported ${cleanModFolder} to ${outputPath}`);
       } else {
-        // ===== BATCH SAVE ALL SLOTS =====
-        const totalSlots = batchSlots.length;
-        const allContainerFiles: string[] = [];
+        // ===== BATCH SAVE WITH SELECTIVE MULTI-BUNDLE MATRIX =====
+        const totalSlots = options.slots.length;
         const currentRecipe = compileCurrentRecipe();
 
+        // Map to collect container files for each distinct bundle group: groupName -> filePaths[]
+        const bundleGroupFiles: Record<string, string[]> = {};
+        for (const sc of options.slots) {
+          if (sc.exportMode === 'bundle' && sc.bundleGroup.trim()) {
+            const bg = sc.bundleGroup.trim();
+            if (!bundleGroupFiles[bg]) bundleGroupFiles[bg] = [];
+          }
+        }
+
         for (let sIdx = 0; sIdx < totalSlots; sIdx++) {
-          const slot = batchSlots[sIdx];
-          const cleanModFolder = slot.customLabel.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
+          const slotConfig = options.slots[sIdx];
+          const slot = batchSlots.find(s => s.slotId === slotConfig.slotId) || batchSlots[sIdx];
+          if (!slot) continue;
+
+          const cleanModFolder = slotConfig.customLabel.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_');
+          const isBundled = slotConfig.exportMode === 'bundle' && !!slotConfig.bundleGroup.trim();
+          const bundleName = isBundled ? slotConfig.bundleGroup.trim() : undefined;
 
           setConversionProgress({
             current: sIdx + 1,
             total: totalSlots,
-            fileName: `[${sIdx + 1}/${totalSlots}] Exporting ${cleanModFolder}...`,
+            fileName: `[${sIdx + 1}/${totalSlots}] Packaging ${cleanModFolder}...`,
           });
 
           const modifiedFiles: Record<string, any> = {};
@@ -975,9 +1018,20 @@ export function App() {
             if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
           });
 
+          // 1. JSON Dumps if requested
+          if (options.exportJson) {
+            const jsonDumpDir = `${outputPath}/${cleanModFolder}/JSON`;
+            for (const keyPath of Object.keys(modifiedFiles)) {
+              const outJsonPath = `${jsonDumpDir}/${keyPath.replace(/\.uasset$/i, '.json')}`;
+              const parentDir = outJsonPath.substring(0, Math.max(outJsonPath.lastIndexOf('/'), outJsonPath.lastIndexOf('\\')));
+              await tauri.createDirectory(parentDir).catch(() => {});
+              await tauri.writeTextFile(outJsonPath, JSON.stringify(modifiedFiles[keyPath], null, 2));
+            }
+          }
+
+          // 2. Prepare JSONs for UAsset compilation
           const jsonPathsForConversion: string[] = [];
           const filesToSave = Object.keys(modifiedFiles).filter(k => slot.uassetSourceMap[k]?.jsonPath);
-
           for (const keyPath of filesToSave) {
             const sourceInfo = slot.uassetSourceMap[keyPath];
             if (sourceInfo?.jsonPath) {
@@ -991,77 +1045,145 @@ export function App() {
             }
           }
 
-          // Auto-write .rvfxp preset V2 for this slot using its isolated recipe
-          const slotRecipe = (slot.slotId === activeSlotId ? currentRecipe : slot.recipe) || currentRecipe;
-          const slotSessionData: SessionEntry[] = slot.colorParams.map(p => ({
-            relativePath: p.relativePath.replace(/\.json$/i, ''),
-            paramName: p.paramName,
-            rgba: p.rgba,
-          }));
-          const slotPreset: RvfxpPresetV2 = {
-            version: 2,
-            generator: 'RivalsVFXEditor',
-            timestamp: new Date().toISOString(),
-            recipe: slotRecipe,
-            slots: [
-              {
-                slotId: slot.slotId,
-                heroId: slot.heroId,
-                heroName: slot.heroName,
-                customLabel: cleanModFolder,
-              },
-            ],
-            savedParameters: slotSessionData,
-          };
-          await tauri.writeTextFile(
-            `${outputPath}/${cleanModFolder}.rvfxp`,
-            JSON.stringify(slotPreset, null, 2)
-          );
+          // 3. Write Recipe .rvfxp Preset for this slot
+          if (options.exportRvfxpPreset) {
+            const slotRecipe = (slot.slotId === activeSlotId ? currentRecipe : slot.recipe) || currentRecipe;
+            const slotSessionData: SessionEntry[] = slot.colorParams.map(p => ({
+              relativePath: p.relativePath.replace(/\.json$/i, ''),
+              paramName: p.paramName,
+              rgba: p.rgba,
+            }));
+            const slotPreset: RvfxpPresetV2 = {
+              version: 2,
+              generator: 'RivalsVFXEditor',
+              timestamp: new Date().toISOString(),
+              recipe: slotRecipe,
+              slots: [
+                {
+                  slotId: slot.slotId,
+                  heroId: slot.heroId,
+                  heroName: slot.heroName,
+                  customLabel: cleanModFolder,
+                  bundleGroup: bundleName,
+                },
+              ],
+              savedParameters: slotSessionData,
+            };
+            const slotPresetPath = `${outputPath}/${cleanModFolder}.rvfxp`;
+            await tauri.writeTextFile(slotPresetPath, JSON.stringify(slotPreset, null, 2));
+          }
 
-          if (jsonPathsForConversion.length > 0) {
+          // 4. Raw Loose UAssets if requested
+          if (options.exportRawUassets && jsonPathsForConversion.length > 0) {
+            await tauri.packageIostoreMod({
+              mod_name: cleanModFolder,
+              output_dir: outputPath,
+              json_paths: jsonPathsForConversion,
+              target_format: 'raw_uassets',
+              compress: false,
+              create_zip: false,
+            });
+          }
+
+          // 5. Game-Ready IoStore Mod if requested
+          if (options.exportIoStore && jsonPathsForConversion.length > 0) {
             const packRes = await tauri.packageIostoreMod({
               mod_name: cleanModFolder,
               output_dir: outputPath,
               json_paths: jsonPathsForConversion,
-              target_format: options.targetFormat,
+              target_format: 'iostore',
               compress: options.compressOodle,
-              create_zip: !options.bundleName && options.createZip,
-              bundle_name: options.bundleName || null,
+              create_zip: !isBundled && options.exportZip,
+              bundle_name: bundleName || null,
             });
 
-            if (packRes.utocPath) allContainerFiles.push(packRes.utocPath);
-            if (packRes.ucasPath) allContainerFiles.push(packRes.ucasPath);
-            if (packRes.pakPath) allContainerFiles.push(packRes.pakPath);
+            if (isBundled && bundleName) {
+              if (packRes.utocPath) bundleGroupFiles[bundleName].push(packRes.utocPath);
+              if (packRes.ucasPath) bundleGroupFiles[bundleName].push(packRes.ucasPath);
+              if (packRes.pakPath) bundleGroupFiles[bundleName].push(packRes.pakPath);
+            }
           }
 
-          debug.addLog(`✓ Exported ${cleanModFolder} into separate mod folder`);
+          debug.addLog(`✓ Processed mod slot ${cleanModFolder} [${isBundled ? `Bundle: ${bundleName}` : 'Solo'}]`);
         }
 
-        // If bundle name requested, create unified bundle zip archive
-        if (options.targetFormat === 'iostore' && options.bundleName && allContainerFiles.length > 0) {
-          setConversionProgress({
-            current: totalSlots,
-            total: totalSlots,
-            fileName: `Building unified bundle archive: ${options.bundleName}.zip...`,
-          });
-          await tauri.createBundleZip(options.bundleName, outputPath, allContainerFiles);
-          debug.addLog(`✓ Created bundle zip archive: ${options.bundleName}.zip (${allContainerFiles.length} files)`);
+        // 6. Build unified ZIP archives for each distinct bundle group
+        if (options.exportZip) {
+          for (const [bgName, containerFiles] of Object.entries(bundleGroupFiles)) {
+            if (containerFiles.length > 0) {
+              setConversionProgress({
+                current: totalSlots,
+                total: totalSlots,
+                fileName: `Building bundle archive: ${bgName}.zip (${containerFiles.length} files)...`,
+              });
+              await tauri.createBundleZip(bgName, outputPath, containerFiles);
+              debug.addLog(`✓ Created bundle archive: ${bgName}.zip with ${containerFiles.length} files`);
+            }
+          }
         }
 
-        setSaveStatus(`All ${totalSlots} mod packs saved!`);
+        // 7. Export unified multi-hero Project .rvfxp file preserving the entire workspace matrix
+        if (options.exportRvfxpPreset) {
+          const batchProjectPreset: RvfxpPresetV2 = {
+            version: 2,
+            generator: 'RivalsVFXEditor',
+            timestamp: new Date().toISOString(),
+            recipe: currentRecipe,
+            slots: options.slots.map((sc: ExportSlotConfig) => {
+              const origSlot = batchSlots.find(s => s.slotId === sc.slotId);
+              return {
+                slotId: sc.slotId,
+                heroId: sc.heroId,
+                heroName: sc.heroName,
+                customLabel: sc.customLabel,
+                bundleGroup: sc.exportMode === 'bundle' ? sc.bundleGroup : undefined,
+                recipe: origSlot?.recipe || currentRecipe,
+              };
+            }),
+            savedParameters: [],
+          };
+          const projectPresetPath = `${outputPath}/BatchMatrix_Project_${Date.now()}.rvfxp`;
+          await tauri.writeTextFile(projectPresetPath, JSON.stringify(batchProjectPreset, null, 2));
+          debug.addLog(`✓ Exported workspace matrix preset to ${projectPresetPath}`);
+        }
+
+        // Sync custom labels and bundle groups back into batchSlots in React state
+        setBatchSlots(prev =>
+          prev.map(slot => {
+            const sc = options.slots.find((s: ExportSlotConfig) => s.slotId === slot.slotId);
+            if (sc) {
+              return {
+                ...slot,
+                customLabel: sc.customLabel,
+                bundleGroup: sc.exportMode === 'bundle' ? sc.bundleGroup : undefined,
+              };
+            }
+            return slot;
+          })
+        );
+
+        setSaveStatus(`All ${totalSlots} mod outputs packaged successfully!`);
         await tauri.openFolder(outputPath);
-        debug.addLog(`✓ All ${totalSlots} mod packs saved in ${outputPath}`);
+        debug.addLog(`✓ Export Matrix completed: ${totalSlots} mods in ${outputPath}`);
       }
     } catch (err: any) {
       alert(`Save error: ${err.message || err}`);
     } finally {
       setIsConverting(false);
       setConversionProgress({ current: 0, total: 0, fileName: '' });
-      setTimeout(() => setSaveStatus(''), 8000);
     }
   }, [
-    saveModalIsBatch, sessionName, uassetSourceMap, originalFiles, colorParams,
-    activeSlotId, currentHeroId, currentHeroName, batchSlots, debug, compileCurrentRecipe,
+    saveModalIsBatch,
+    sessionName,
+    uassetSourceMap,
+    originalFiles,
+    colorParams,
+    activeSlotId,
+    currentHeroId,
+    currentHeroName,
+    compileCurrentRecipe,
+    batchSlots,
+    debug,
   ]);
 
   const applyRecipeToCurrentParams = useCallback((recipe: RvfxpRecipe) => {
@@ -1370,6 +1492,17 @@ export function App() {
     setActiveRecipeTracker({});
   }, [resetHistory]);
 
+  const handleBackToMenu = useCallback(() => {
+    const hasEdits = historyIndex > 0;
+    if (hasEdits) {
+      if (!window.confirm('Discard current edits and return to the main menu?')) {
+        return;
+      }
+    }
+    handleReset();
+    debug.addLog('Closed project, returned to main menu');
+  }, [historyIndex, handleReset, debug]);
+
   // === GLOBAL FILE DROP HANDLING ===
   const handleFilesDropped = useCallback(async (filePaths: string[]) => {
     if (!filePaths || filePaths.length === 0) return;
@@ -1570,16 +1703,14 @@ export function App() {
       <div className="w-full flex-1 flex flex-col min-h-0">
         <Header
           settings={settings}
+          isProjectActive={colorParams.length > 0 || batchSlots.length > 0}
+          projectTitle={isBatchMode ? `Batch (${batchSlots.length} Slots)` : (currentHeroName || sessionName)}
           onOpenSettings={() => setShowSettings(true)}
           onOpenFilterSettings={() => setShowFilterSettings(true)}
           onOpenVfxUpdater={() => setShowVfxUpdater(true)}
+          onCloseProject={handleBackToMenu}
           onReset={handleReset}
           addDebugLog={debug.addLog}
-          onToggleMinimize={() => {
-            const newVal = !settings.isHeaderMinimized;
-            setSettings(s => ({ ...s, isHeaderMinimized: newVal }));
-            tauri.setHeaderMinimized(newVal).catch(console.error);
-          }}
         />
 
         {usmapLoading && (
@@ -1589,7 +1720,7 @@ export function App() {
           </div>
         )}
 
-        <div className="mt-8 mb-0 flex-1 flex flex-col min-h-0">
+        <div className="mt-4 mb-0 flex-1 flex flex-col min-h-0">
           {showManualExtraction ? (
             <ManualExtractionPage
               onClose={() => setShowManualExtraction(false)}
@@ -1843,11 +1974,24 @@ export function App() {
                 const result = await tauri.batchConvertDirectory(selectedPath);
                 const fileObjs: FileObject[] = [];
                 const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
+                const normSelectedPath = selectedPath.replace(/\\/g, '/').replace(/\/+$/, '');
                 for (let i = 0; i < result.json_paths.length; i++) {
-                  const content = await tauri.readTextFile(result.json_paths[i]);
-                  const name = result.json_paths[i].split(/[\\/]/).pop() || '';
-                  fileObjs.push({ name, content, relativePath: name });
-                  srcMap[name] = { uassetPath: result.uasset_paths[i], jsonPath: result.json_paths[i] };
+                  const jsonPath = result.json_paths[i];
+                  const uassetPath = result.uasset_paths[i] || '';
+                  const content = await tauri.readTextFile(jsonPath);
+                  const normJsonPath = jsonPath.replace(/\\/g, '/');
+                  const normUassetPath = uassetPath.replace(/\\/g, '/');
+                  const name = normJsonPath.split('/').pop() || '';
+                  let relPath = '';
+                  if (normUassetPath && normUassetPath.startsWith(normSelectedPath)) {
+                    relPath = normUassetPath.substring(normSelectedPath.length).replace(/^\/+/, '');
+                  } else if (normUassetPath.includes('/Content/')) {
+                    relPath = normUassetPath.split('/Content/').pop() || name;
+                  } else {
+                    relPath = name;
+                  }
+                  fileObjs.push({ name, content, relativePath: relPath });
+                  srcMap[relPath] = { uassetPath, jsonPath };
                 }
                 setUassetSourceMap(srcMap);
                 const freshParams: ColorParam[] = [];
@@ -1862,6 +2006,12 @@ export function App() {
                 setOriginalFiles(freshFiles);
                 setInitialHistory(freshParams);
                 setSelectedParams(new Set(freshParams.map(p => p.id)));
+                const uniqueFolders = [...new Set(freshParams.map(p => {
+                  const lastSlash = p.relativePath.lastIndexOf('/');
+                  return lastSlash > 0 ? p.relativePath.substring(0, lastSlash) : '/';
+                }))];
+                setFolders(uniqueFolders.sort());
+                setSelectedFolders(new Set(uniqueFolders));
                 setIsConverting(false);
               }}
               onBrowseHeroes={() => setShowHeroBrowser(true)}
@@ -1955,16 +2105,11 @@ export function App() {
         onClose={() => setShowSaveModModal(false)}
         onConfirm={handleConfirmSaveMod}
         isBatch={saveModalIsBatch}
-        slotCount={saveModalIsBatch ? batchSlots.length : 1}
+        slots={batchSlots}
         initialModName={
           saveModalIsBatch
             ? 'Batch_VFX_Mods'
             : sessionName.replace(/\.rvfxp$/i, '').replace(/\s+/g, '_')
-        }
-        initialBundleName={
-          saveModalIsBatch
-            ? batchSlots.find(s => s.bundleGroup)?.bundleGroup || ''
-            : ''
         }
       />
 

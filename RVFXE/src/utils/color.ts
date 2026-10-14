@@ -188,10 +188,13 @@ export function invertColorRgba(rgba: RGBA): RGBA {
   return applyHueShiftToRgba(rgba, 180, false);
 }
 
+const GOLDEN_RATIO_CONJUGATE = 0.618033988749895;
+
 /**
  * Generate N procedurally varied colors based on a palette of sample swatches.
- * Ensures each file/parameter receives a unique, aesthetic variation clustered
- * around the sample palette swatches.
+ * Uses a Harmonic Color Engine with golden ratio hue distribution and vibrancy
+ * guardrails (clamped saturation and lightness) to guarantee vibrant, non-muddy
+ * superhero VFX across any number of parameters (10,000+).
  */
 export function generateProceduralColors(
   sampleHexes: string[],
@@ -202,7 +205,7 @@ export function generateProceduralColors(
   if (count <= 0) return [];
 
   const validSamples = sampleHexes.filter(isValidHex);
-  const palette = validSamples.length > 0 ? validSamples : ['#3b82f6', '#10b981', '#f59e0b'];
+  const palette = validSamples.length > 0 ? validSamples : ['#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6'];
 
   // Convert palette to HSL
   const hslPalette = palette.map(hex => {
@@ -220,30 +223,38 @@ export function generateProceduralColors(
     const [h2, s2, l2] = hslPalette[nextIdx];
 
     // Sub-position within segment
-    const t = Math.sin((i / count) * Math.PI * 2) * 0.5 + 0.5;
+    const t = Math.sin((i / Math.max(1, count)) * Math.PI * 2) * 0.5 + 0.5;
+
+    // Golden ratio conjugate hue distribution step
+    const goldenOffset = (i * GOLDEN_RATIO_CONJUGATE) % 1.0;
 
     // Pseudo-random deterministic hash for jitter based on index
-    const hash = Math.sin(i * 12.9898 + 78.233) * 43758.5453;
-    const rand1 = (hash - Math.floor(hash));
-    const hash2 = Math.cos(i * 39.346 + 11.135) * 24634.63;
-    const rand2 = (hash2 - Math.floor(hash2));
-    const hash3 = Math.sin(i * 91.22 + 45.1) * 31415.92;
-    const rand3 = (hash3 - Math.floor(hash3));
+    const hash = Math.sin((i + 1) * 12.9898 + 78.233) * 43758.5453;
+    const rand1 = hash - Math.floor(hash);
+    const hash2 = Math.cos((i + 1) * 39.346 + 11.135) * 24634.63;
+    const rand2 = hash2 - Math.floor(hash2);
+    const hash3 = Math.sin((i + 1) * 91.22 + 45.1) * 31415.92;
+    const rand3 = hash3 - Math.floor(hash3);
 
     // Interpolate hue with shortest circular path
     let diffH = h2 - h1;
     if (diffH > 0.5) diffH -= 1.0;
     if (diffH < -0.5) diffH += 1.0;
-    let baseH = h1 + diffH * t;
+    const baseH = h1 + diffH * t;
 
-    // Apply controlled jitter
-    const hueJitter = (rand1 - 0.5) * jitterAmount * 0.25;
-    let finalH = baseH + hueJitter;
-    if (finalH < 0) finalH += 1;
-    if (finalH > 1) finalH -= 1;
+    // Harmonic blend: combine base hue with golden ratio offset and controlled jitter
+    let finalH = baseH + (rand1 - 0.5) * jitterAmount * 0.25 + goldenOffset * (jitterAmount * 0.35);
+    finalH = ((finalH % 1.0) + 1.0) % 1.0;
 
-    const finalS = Math.min(1.0, Math.max(0.15, (s1 * (1 - t) + s2 * t) + (rand2 - 0.5) * jitterAmount * 0.2));
-    const finalL = Math.min(0.9, Math.max(0.15, (l1 * (1 - t) + l2 * t) + (rand3 - 0.5) * jitterAmount * 0.15));
+    // Vibrancy Guardrails:
+    // Clamp saturation to [0.65, 1.0] to guarantee rich, vivid VFX (prevent gray/brown mud)
+    const baseSat = Math.max(s1 * (1 - t) + s2 * t, 0.70);
+    const finalS = Math.min(1.0, Math.max(0.65, baseSat + (rand2 - 0.5) * jitterAmount * 0.2));
+
+    // Clamp lightness to [0.45, 0.68] to avoid murky blacks or washed-out whites
+    const baseLit = l1 * (1 - t) + l2 * t;
+    const targetLit = (baseLit >= 0.35 && baseLit <= 0.75) ? baseLit : 0.55;
+    const finalL = Math.min(0.68, Math.max(0.45, targetLit + (rand3 - 0.5) * jitterAmount * 0.15));
 
     const [r, g, b] = hslToRgb(finalH, finalS, finalL);
     results.push(rgbaToDisplayHex(r, g, b));

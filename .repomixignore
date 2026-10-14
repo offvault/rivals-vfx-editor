@@ -1,0 +1,13 @@
+# Ignore browser runtimes & minified CSS/JS
+RVFXE/js/*.min.js
+RVFXE/js/*.development.js
+RVFXE/css/*.min.css
+RVFXE/css/*.css
+
+# Common build output & caches
+**/node_modules/**
+**/bin/**
+**/obj/**
+**/target/**
+**/dist/**
+repomix-output.xml

@@ -32,22 +32,29 @@ export function LoadFilesPanel({
         >
           <div
             onClick={hasUsmapPath ? onSelectFolder : undefined}
-            className={`w-full h-full flex flex-col items-center justify-center ${hasUsmapPath ? 'cursor-pointer' : 'cursor-not-allowed'}`}
+            className={`w-full h-full flex flex-col items-center justify-center py-6 transition-all ${hasUsmapPath ? 'cursor-pointer hover:opacity-90' : 'cursor-not-allowed'}`}
           >
-            <svg className="mx-auto h-12 w-12" style={{ color: 'var(--text-4)' }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-              <polyline points="14 2 14 8 20 8"></polyline>
-              <path d="M9 15.5a1.5 1.5 0 0 0-3 0v1a1.5 1.5 0 0 0 3 0"></path>
-              <path d="M18 15.5a1.5 1.5 0 0 0-3 0v1a1.5 1.5 0 0 0 3 0"></path>
-            </svg>
-            <div className="flex items-center gap-2 mt-2">
-              <h3 className="text-lg font-medium" style={{ color: 'var(--text-2)' }}>No files loaded</h3>
-              <img src="./assets/images/shrug.png" alt="shrug emoji" className="h-6 w-6" />
+            <div
+              className="w-14 h-14 rounded-full flex items-center justify-center mb-3 border transition-transform duration-200"
+              style={{
+                backgroundColor: 'var(--bg-1)',
+                borderColor: isDragging ? 'var(--accent-main)' : 'var(--bg-1)',
+                transform: isDragging ? 'scale(1.1)' : 'scale(1)',
+              }}
+            >
+              <svg className="h-7 w-7" style={{ color: isDragging ? 'var(--accent-main)' : 'var(--text-3)' }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
             </div>
-            <p className="mt-1 text-sm font-medium" style={{ color: hasUsmapPath ? 'var(--text-4)' : 'var(--accent-warning, #f59e0b)' }}>
+            <h3 className="text-sm font-bold tracking-wider uppercase" style={{ color: 'var(--text-1)' }}>
+              {isDragging ? 'Release to Load Files' : 'Import Assets or Presets'}
+            </h3>
+            <p className="mt-1 text-xs max-w-sm text-center font-mono leading-relaxed" style={{ color: hasUsmapPath ? 'var(--text-4)' : 'var(--accent-warning, #f59e0b)' }}>
               {hasUsmapPath
-                ? 'Drag and drop .uasset files or click here to browse.'
-                : 'Set a valid mapping file in the settings to proceed'}
+                ? 'Drop .uasset files, a materials folder, or .rvfxp project recipes — or click to browse.'
+                : 'Configure .usmap and Game Paks in Settings to begin editing.'}
             </p>
           </div>
         </div>

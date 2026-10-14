@@ -170,6 +170,8 @@ export interface RvfxpSlot {
   heroId: string;
   heroName: string;
   customLabel: string;
+  bundleGroup?: string;
+  recipe?: RvfxpRecipe;
   targetSubpaths?: string[];
 }
 
@@ -183,7 +185,27 @@ export interface RvfxpPresetV2 {
   savedParameters: SessionEntry[];
 }
 
-// ===== 1-Click Direct Mod Packaging Options =====
+// ===== 1-Click Direct Mod Packaging & Export Matrix Options =====
+export interface ExportSlotConfig {
+  slotId: string;
+  heroId: string;
+  heroName: string;
+  customLabel: string;
+  exportMode: 'solo' | 'bundle';
+  bundleGroup: string;
+}
+
+export interface ExportMatrixOptions {
+  exportIoStore: boolean;
+  exportZip: boolean;
+  exportRawUassets: boolean;
+  exportJson: boolean;
+  compressOodle: boolean;
+  pakReady: boolean;
+  slots: ExportSlotConfig[];
+  exportRvfxpPreset: boolean;
+}
+
 export interface PackagingOptions {
   targetFormat: 'iostore' | 'raw_uassets';
   compress: boolean;

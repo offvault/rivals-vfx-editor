@@ -42,6 +42,16 @@ impl Default for FilterDictionary {
                 "Emiss".to_string(),
                 "Diff".to_string(),
                 "XKTex3_Col".to_string(),
+                "rgb".to_string(),
+                "glow".to_string(),
+                "albedo".to_string(),
+                "fresnel".to_string(),
+                "liquid".to_string(),
+                "light".to_string(),
+                "core".to_string(),
+                "rim".to_string(),
+                "fx".to_string(),
+                "base".to_string(),
             ],
             exclude_keywords: vec![
                 "Offset".to_string(),
@@ -2653,25 +2663,29 @@ async fn batch_convert_directory(
 
     drop(process_guard);
 
-    // Only match JSON files that correspond to the input uasset files
-    let expected_stems: std::collections::HashSet<String> = file_paths
-        .iter()
-        .filter_map(|p| {
-            Path::new(p)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_lowercase())
-        })
-        .collect();
+    // Map input uassets by their relative path from root_dir (normalized lowercase without extension)
+    let mut uasset_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for p in &file_paths {
+        let path_obj = Path::new(p);
+        if let Ok(rel) = path_obj.strip_prefix(&root_dir) {
+            let key = rel.with_extension("").to_string_lossy().replace('\\', "/").to_lowercase();
+            uasset_map.insert(key, p.clone());
+        }
+    }
 
-    let json_paths: Vec<String> = find_files_recursive(&json_dir, ".json")
-        .iter()
-        .filter(|p| {
-            p.file_stem()
-                .map(|s| expected_stems.contains(&s.to_string_lossy().to_lowercase()))
-                .unwrap_or(false)
-        })
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
+    let all_jsons = find_files_recursive(&json_dir, ".json");
+    let mut matched_uassets: Vec<String> = Vec::new();
+    let mut matched_jsons: Vec<String> = Vec::new();
+
+    for p in all_jsons {
+        if let Ok(rel) = p.strip_prefix(&json_dir) {
+            let key = rel.with_extension("").to_string_lossy().replace('\\', "/").to_lowercase();
+            if let Some(src_uasset) = uasset_map.get(&key) {
+                matched_uassets.push(src_uasset.clone());
+                matched_jsons.push(p.to_string_lossy().to_string());
+            }
+        }
+    }
 
     let _ = app.emit(
         "conversion-progress",
@@ -2686,15 +2700,15 @@ async fn batch_convert_directory(
     );
 
     eprintln!(
-        "[DEBUG] batch_convert_directory complete: {}/{} JSON files",
-        json_paths.len(),
+        "[DEBUG] batch_convert_directory complete: {}/{} JSON files matched 1-to-1",
+        matched_jsons.len(),
         total
     );
 
     Ok(HeroVfxResult {
         hero_id: String::new(),
-        uasset_paths: file_paths,
-        json_paths,
+        uasset_paths: matched_uassets,
+        json_paths: matched_jsons,
         cached: false,
         error: None,
     })
@@ -2779,25 +2793,26 @@ async fn batch_convert_files(
 
     drop(process_guard);
 
-    // Only match JSON files that correspond to the input uasset files
-    let expected_stems: std::collections::HashSet<String> = uasset_paths
-        .iter()
-        .filter_map(|p| {
-            Path::new(p)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_lowercase())
-        })
-        .collect();
+    // Map input uassets by stem or relative path to match 1-to-1 with converted JSONs
+    let mut uasset_stem_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for p in &uasset_paths {
+        if let Some(stem) = Path::new(p).file_stem() {
+            uasset_stem_map.insert(stem.to_string_lossy().to_lowercase(), p.clone());
+        }
+    }
 
-    let json_paths: Vec<String> = find_files_recursive(&json_dir, ".json")
-        .iter()
-        .filter(|p| {
-            p.file_stem()
-                .map(|s| expected_stems.contains(&s.to_string_lossy().to_lowercase()))
-                .unwrap_or(false)
-        })
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
+    let all_jsons = find_files_recursive(&json_dir, ".json");
+    let mut matched_uassets: Vec<String> = Vec::new();
+    let mut matched_jsons: Vec<String> = Vec::new();
+
+    for p in all_jsons {
+        if let Some(stem) = p.file_stem() {
+            if let Some(src_uasset) = uasset_stem_map.get(&stem.to_string_lossy().to_lowercase()) {
+                matched_uassets.push(src_uasset.clone());
+                matched_jsons.push(p.to_string_lossy().to_string());
+            }
+        }
+    }
 
     let _ = app.emit(
         "conversion-progress",
@@ -2813,8 +2828,8 @@ async fn batch_convert_files(
 
     Ok(HeroVfxResult {
         hero_id: String::new(),
-        uasset_paths,
-        json_paths,
+        uasset_paths: matched_uassets,
+        json_paths: matched_jsons,
         cached: false,
         error: None,
     })

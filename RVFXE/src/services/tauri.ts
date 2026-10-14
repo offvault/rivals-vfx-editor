@@ -12,14 +12,17 @@ import type {
   UsmapStatus,
 } from '@/types';
 
-// ===== Core Tauri APIs =====
 const { invoke } = (window as any).__TAURI__.core;
 const { listen } = (window as any).__TAURI__.event;
 const { open: openDialog, save: saveDialog } = (window as any).__TAURI__.dialog;
-const { readDir, readTextFile, writeTextFile, stat } = (window as any).__TAURI__.fs;
+const { readDir, readTextFile, writeTextFile, stat, mkdir } = (window as any).__TAURI__.fs;
 
 // Re-export listen for event subscriptions
-export { listen, openDialog, saveDialog, readDir, readTextFile, writeTextFile, stat };
+export { listen, openDialog, saveDialog, readDir, readTextFile, writeTextFile, stat, mkdir };
+
+export async function createDirectory(path: string): Promise<void> {
+  return mkdir(path, { recursive: true });
+}
 
 // ===== Typed invoke wrappers =====
 

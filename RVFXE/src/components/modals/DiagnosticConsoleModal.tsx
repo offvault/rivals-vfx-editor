@@ -64,11 +64,25 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
     setTimeout(() => setIsCopied(false), 2000);
   };
 
+  // Escape key handler to close modal
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 select-none">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 select-none"
+      style={{ backgroundColor: 'rgba(0, 0, 0, 0.85)', backdropFilter: 'blur(4px)' }}
+      onClick={onClose}
+    >
       <div
         className="w-full max-w-4xl h-[700px] max-h-[90vh] flex flex-col border-2 shadow-2xl overflow-hidden font-mono"
         style={{ backgroundColor: '#0d0f12', borderColor: '#262930' }}
+        onClick={(e) => e.stopPropagation()}
       >
         {/* Terminal Header */}
         <div

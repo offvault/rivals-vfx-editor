@@ -8,7 +8,7 @@ export interface AutoTwelveColorModalProps {
   heroId: string;
   heroName: string;
   colorParams: ColorParam[];
-  originalFiles: Record<string, any>;
+  originalFiles?: Record<string, any>;
   uassetSourceMap: UassetSourceMap;
   preserveIntensity: boolean;
   ignoreGrayscale: boolean;
@@ -103,32 +103,17 @@ export function AutoTwelveColorModal({
         setCurrentStep(`[${t + 1}/${totalThemes}] Generating ${theme.name}...`);
         setProgressPercent(Math.round(((t) / totalThemes) * 100));
 
-        // Prepare modified files
-        const themeModifiedFiles: Record<string, any> = {};
-        for (const keyPath of Object.keys(originalFiles)) {
-          themeModifiedFiles[keyPath] = structuredClone(originalFiles[keyPath]);
-        }
-
         const themeRgb = hexToRgba(theme.hex);
         const enemyRgb = hexToRgba(theme.enemyHex);
         const themeSessionData: { relativePath: string; paramName: string; rgba: RGBA }[] = [];
 
-        // Apply recoloring per param
+        // Group color parameters by relativePath
+        const paramsByFile = new Map<string, { param: ColorParam; newRgba: RGBA }[]>();
         for (const param of colorParams) {
           const isEnemy = isEnemyParameter(param);
-          let newRgba: RGBA;
-
-          if (isEnemy) {
-            newRgba = applyColorToParam(param.rgba, enemyRgb, {
-              preserveIntensity,
-              ignoreGrayscale,
-            });
-          } else {
-            newRgba = applyColorToParam(param.rgba, themeRgb, {
-              preserveIntensity,
-              ignoreGrayscale,
-            });
-          }
+          const newRgba = isEnemy
+            ? applyColorToParam(param.rgba, enemyRgb, { preserveIntensity, ignoreGrayscale })
+            : applyColorToParam(param.rgba, themeRgb, { preserveIntensity, ignoreGrayscale });
 
           themeSessionData.push({
             relativePath: param.relativePath.replace(/\.json$/i, ''),
@@ -136,28 +121,36 @@ export function AutoTwelveColorModal({
             rgba: newRgba,
           });
 
-          const targetFile = themeModifiedFiles[param.relativePath];
-          if (targetFile) {
-            setNestedValue(targetFile, param.path, newRgba);
-          }
+          const list = paramsByFile.get(param.relativePath) || [];
+          list.push({ param, newRgba });
+          paramsByFile.set(param.relativePath, list);
         }
 
-        // Write modified JSONs to disk
+        // Write modified JSONs to disk on-demand with minimal memory footprint
         const jsonPathsForConversion: string[] = [];
-        const filesToSave = Object.keys(themeModifiedFiles).filter(k => uassetSourceMap[k]?.jsonPath);
-
-        for (const keyPath of filesToSave) {
+        for (const [keyPath, items] of paramsByFile.entries()) {
           const sourceInfo = uassetSourceMap[keyPath];
           if (sourceInfo && sourceInfo.jsonPath) {
-            const jsonContent = JSON.stringify(themeModifiedFiles[keyPath], null, 2);
-            await tauri.writeTextFile(sourceInfo.jsonPath, jsonContent);
+            try {
+              let fileJson: any = null;
+              if (originalFiles && originalFiles[keyPath]) {
+                fileJson = structuredClone(originalFiles[keyPath]);
+              } else {
+                const fileContent = await tauri.readTextFile(sourceInfo.jsonPath);
+                fileJson = JSON.parse(fileContent);
+              }
+              for (const item of items) {
+                setNestedValue(fileJson, item.param.path, item.newRgba);
+              }
+              await tauri.writeTextFile(sourceInfo.jsonPath, JSON.stringify(fileJson, null, 2));
 
-            // Universal dynamic pak-ready path resolution
-            const outRelPath = pakReady
-              ? getPakReadyRelativePath(keyPath, modFolderName)
-              : `${modFolderName}/${keyPath.replace(/\.json$/i, '.uasset')}`;
+              // Universal dynamic pak-ready path resolution
+              const outRelPath = pakReady
+                ? getPakReadyRelativePath(keyPath, modFolderName)
+                : `${modFolderName}/${keyPath.replace(/\.json$/i, '.uasset')}`;
 
-            jsonPathsForConversion.push(`${sourceInfo.jsonPath},${outRelPath}`);
+              jsonPathsForConversion.push(`${sourceInfo.jsonPath},${outRelPath}`);
+            } catch (e) {}
           }
         }
 

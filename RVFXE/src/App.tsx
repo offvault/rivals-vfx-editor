@@ -66,7 +66,7 @@ interface HeroSlotWorkspace {
   bundleGroup?: string;
   koMode: boolean;
   colorParams: ColorParam[];
-  originalFiles: Record<string, any>;
+  originalFiles?: Record<string, any>;
   uassetSourceMap: UassetSourceMap;
   selectedParams: Set<string>;
   recipe?: RvfxpRecipe;
@@ -272,7 +272,6 @@ export function App() {
     const res = await tauri.extractHeroVfx(heroId, koMode, forceRefresh);
     const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
     const freshParams: ColorParam[] = [];
-    const freshFiles: Record<string, any> = {};
 
     const totalFiles = res.json_paths.length;
     tauri.logFrontendMessage('INFO', `[Hero ${heroId}] Parsing ${totalFiles} material JSONs...`).catch(() => {});
@@ -299,12 +298,7 @@ export function App() {
       try {
         const content = await tauri.readTextFile(jsonPath);
         const json = JSON.parse(content);
-        const beforeCount = freshParams.length;
         parseJsonAndExtractColors(json, fileName, relativePath, freshParams, filterDictionary, debug.addLog);
-        if (freshParams.length > beforeCount) {
-          // Retain JSON AST only if this file actually has editable colors
-          freshFiles[relativePath] = json;
-        }
       } catch (e) {}
 
       // Yield every 30 files so V8 can run incremental GC and prevent memory spikes
@@ -315,10 +309,10 @@ export function App() {
 
     tauri.logFrontendMessage(
       'INFO',
-      `[Hero ${heroId}] Done parsing: ${freshParams.length} color params in ${Object.keys(freshFiles).length}/${totalFiles} files`
+      `[Hero ${heroId}] Done parsing: ${freshParams.length} color params across ${totalFiles} files`
     ).catch(() => {});
 
-    return { srcMap, params: freshParams, originalFiles: freshFiles };
+    return { srcMap, params: freshParams, originalFiles: {} };
   }, [filterDictionary, debug.addLog]);
 
   // === COLOR ACTIONS ===
@@ -670,7 +664,7 @@ export function App() {
     setCurrentHeroId(target.heroId);
     setCurrentHeroName(target.heroName);
     setSessionName(target.customLabel);
-    setOriginalFiles(target.originalFiles);
+    setOriginalFiles(target.originalFiles || {});
     setUassetSourceMap(target.uassetSourceMap);
     setInitialHistory(target.colorParams);
     setSelectedParams(new Set(target.selectedParams));
@@ -736,9 +730,8 @@ export function App() {
         const raw = rawExtractedMap[slot.heroId];
         if (!raw) continue;
 
-        // Deep-clone raw params and originalFiles for complete memory isolation
+        // Deep-clone raw params for complete memory isolation
         const slotParams: ColorParam[] = structuredClone(raw.params);
-        const slotOriginalFiles: Record<string, any> = structuredClone(raw.originalFiles);
 
         // Determine effective recipe
         let effectiveRecipe: RvfxpRecipe | undefined = slot.recipe;
@@ -780,7 +773,7 @@ export function App() {
           bundleGroup: slot.bundleGroup,
           koMode,
           colorParams: slotParams,
-          originalFiles: slotOriginalFiles,
+          originalFiles: {},
           uassetSourceMap: { ...raw.srcMap },
           selectedParams: new Set(slotParams.map(p => p.id)),
           recipe: effectiveRecipe,
@@ -796,7 +789,7 @@ export function App() {
         setCurrentHeroId(first.heroId);
         setCurrentHeroName(first.heroName);
         setSessionName(first.customLabel);
-        setOriginalFiles(first.originalFiles);
+        setOriginalFiles(first.originalFiles || {});
         setUassetSourceMap(first.uassetSourceMap);
         setInitialHistory(first.colorParams);
         setSelectedParams(new Set(first.selectedParams));
@@ -903,47 +896,61 @@ export function App() {
         const uassetKeys = Object.keys(uassetSourceMap);
         if (uassetKeys.length === 0) { alert('No files loaded.'); return; }
 
-        const modifiedFiles: Record<string, any> = {};
-        for (const k of uassetKeys) {
-          if (originalFiles[k]) modifiedFiles[k] = structuredClone(originalFiles[k]);
-        }
+        // Group color params by relativePath for streaming on-demand file patching
+        const paramsByFile = new Map<string, ColorParam[]>();
         for (const p of colorParams) {
-          if (!modifiedFiles[p.relativePath] && uassetSourceMap[p.relativePath]?.jsonPath) {
-            try {
-              const content = await tauri.readTextFile(uassetSourceMap[p.relativePath].jsonPath);
-              modifiedFiles[p.relativePath] = JSON.parse(content);
-            } catch (e) {}
+          let list = paramsByFile.get(p.relativePath);
+          if (!list) {
+            list = [];
+            paramsByFile.set(p.relativePath, list);
           }
-          if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
+          list.push(p);
         }
 
-        // 1. JSON Dumps if requested
-        if (options.exportJson) {
-          const jsonDumpDir = `${outputPath}/${cleanModFolder}/JSON`;
-          for (const keyPath of uassetKeys) {
-            if (modifiedFiles[keyPath]) {
+        const fileKeys = new Set<string>([
+          ...paramsByFile.keys(),
+          ...Object.keys(originalFiles || {}),
+        ]);
+
+        const jsonPathsForConversion: string[] = [];
+        const jsonDumpDir = options.exportJson ? `${outputPath}/${cleanModFolder}/JSON` : null;
+
+        for (const keyPath of fileKeys) {
+          const sourceInfo = uassetSourceMap[keyPath];
+          if (!sourceInfo?.jsonPath) continue;
+
+          try {
+            let fileJson: any = null;
+            if (originalFiles && originalFiles[keyPath]) {
+              fileJson = structuredClone(originalFiles[keyPath]);
+            } else {
+              const content = await tauri.readTextFile(sourceInfo.jsonPath);
+              fileJson = JSON.parse(content);
+            }
+
+            const paramsForThisFile = paramsByFile.get(keyPath);
+            if (paramsForThisFile) {
+              for (const p of paramsForThisFile) {
+                setNestedValue(fileJson, p.path, p.rgba);
+              }
+            }
+
+            // 1. JSON Dumps if requested
+            if (jsonDumpDir) {
               const outJsonPath = `${jsonDumpDir}/${keyPath.replace(/\.uasset$/i, '.json')}`;
               const parentDir = outJsonPath.substring(0, Math.max(outJsonPath.lastIndexOf('/'), outJsonPath.lastIndexOf('\\')));
               await tauri.createDirectory(parentDir).catch(() => {});
-              await tauri.writeTextFile(outJsonPath, JSON.stringify(modifiedFiles[keyPath], null, 2));
+              await tauri.writeTextFile(outJsonPath, JSON.stringify(fileJson, null, 2));
             }
-          }
-          debug.addLog(`✓ Exported JSON parameter dumps to ${jsonDumpDir}`);
-        }
 
-        // 2. Prepare JSONs for UAsset compilation
-        const jsonPathsForConversion: string[] = [];
-        for (const keyPath of uassetKeys) {
-          const sourceInfo = uassetSourceMap[keyPath];
-          if (sourceInfo?.jsonPath && modifiedFiles[keyPath]) {
-            const jsonContent = JSON.stringify(modifiedFiles[keyPath], null, 2);
-            await tauri.writeTextFile(sourceInfo.jsonPath, jsonContent);
+            // 2. Write patched JSON back to sourceInfo.jsonPath
+            await tauri.writeTextFile(sourceInfo.jsonPath, JSON.stringify(fileJson, null, 2));
 
             const outRelPath = options.pakReady
               ? getPakReadyRelativePath(keyPath, cleanModFolder)
               : `${cleanModFolder}/${keyPath.replace(/\.json$/i, '.uasset')}`;
             jsonPathsForConversion.push(`${sourceInfo.jsonPath},${outRelPath}`);
-          }
+          } catch (e) {}
         }
 
         // 3. Write Recipe .rvfxp Preset if requested
@@ -1031,47 +1038,61 @@ export function App() {
             fileName: `[${sIdx + 1}/${totalSlots}] Packaging ${cleanModFolder}...`,
           });
 
-          const modifiedFiles: Record<string, any> = {};
-          if (slot.originalFiles) {
-            for (const k of Object.keys(slot.originalFiles)) {
-              modifiedFiles[k] = structuredClone(slot.originalFiles[k]);
-            }
-          }
+          // Group color params by relativePath for streaming on-demand file patching
+          const paramsByFile = new Map<string, ColorParam[]>();
           for (const p of slot.colorParams) {
-            if (!modifiedFiles[p.relativePath] && slot.uassetSourceMap[p.relativePath]?.jsonPath) {
-              try {
-                const content = await tauri.readTextFile(slot.uassetSourceMap[p.relativePath].jsonPath);
-                modifiedFiles[p.relativePath] = JSON.parse(content);
-              } catch (e) {}
+            let list = paramsByFile.get(p.relativePath);
+            if (!list) {
+              list = [];
+              paramsByFile.set(p.relativePath, list);
             }
-            if (modifiedFiles[p.relativePath]) setNestedValue(modifiedFiles[p.relativePath], p.path, p.rgba);
+            list.push(p);
           }
 
-          // 1. JSON Dumps if requested
-          if (options.exportJson) {
-            const jsonDumpDir = `${outputPath}/${cleanModFolder}/JSON`;
-            for (const keyPath of Object.keys(modifiedFiles)) {
-              const outJsonPath = `${jsonDumpDir}/${keyPath.replace(/\.uasset$/i, '.json')}`;
-              const parentDir = outJsonPath.substring(0, Math.max(outJsonPath.lastIndexOf('/'), outJsonPath.lastIndexOf('\\')));
-              await tauri.createDirectory(parentDir).catch(() => {});
-              await tauri.writeTextFile(outJsonPath, JSON.stringify(modifiedFiles[keyPath], null, 2));
-            }
-          }
+          const fileKeys = new Set<string>([
+            ...paramsByFile.keys(),
+            ...(slot.originalFiles ? Object.keys(slot.originalFiles) : []),
+          ]);
 
-          // 2. Prepare JSONs for UAsset compilation
           const jsonPathsForConversion: string[] = [];
-          const filesToSave = Object.keys(modifiedFiles).filter(k => slot.uassetSourceMap[k]?.jsonPath);
-          for (const keyPath of filesToSave) {
+          const jsonDumpDir = options.exportJson ? `${outputPath}/${cleanModFolder}/JSON` : null;
+
+          for (const keyPath of fileKeys) {
             const sourceInfo = slot.uassetSourceMap[keyPath];
-            if (sourceInfo?.jsonPath) {
-              const jsonContent = JSON.stringify(modifiedFiles[keyPath], null, 2);
-              await tauri.writeTextFile(sourceInfo.jsonPath, jsonContent);
+            if (!sourceInfo?.jsonPath) continue;
+
+            try {
+              let fileJson: any = null;
+              if (slot.originalFiles && slot.originalFiles[keyPath]) {
+                fileJson = structuredClone(slot.originalFiles[keyPath]);
+              } else {
+                const content = await tauri.readTextFile(sourceInfo.jsonPath);
+                fileJson = JSON.parse(content);
+              }
+
+              const paramsForThisFile = paramsByFile.get(keyPath);
+              if (paramsForThisFile) {
+                for (const p of paramsForThisFile) {
+                  setNestedValue(fileJson, p.path, p.rgba);
+                }
+              }
+
+              // 1. JSON Dumps if requested
+              if (jsonDumpDir) {
+                const outJsonPath = `${jsonDumpDir}/${keyPath.replace(/\.uasset$/i, '.json')}`;
+                const parentDir = outJsonPath.substring(0, Math.max(outJsonPath.lastIndexOf('/'), outJsonPath.lastIndexOf('\\')));
+                await tauri.createDirectory(parentDir).catch(() => {});
+                await tauri.writeTextFile(outJsonPath, JSON.stringify(fileJson, null, 2));
+              }
+
+              // 2. Write patched JSON back to sourceInfo.jsonPath
+              await tauri.writeTextFile(sourceInfo.jsonPath, JSON.stringify(fileJson, null, 2));
 
               const outRelPath = options.pakReady
                 ? getPakReadyRelativePath(keyPath, cleanModFolder)
                 : `${cleanModFolder}/${keyPath.replace(/\.json$/i, '.uasset')}`;
               jsonPathsForConversion.push(`${sourceInfo.jsonPath},${outRelPath}`);
-            }
+            } catch (e) {}
           }
 
           // 3. Write Recipe .rvfxp Preset for this slot

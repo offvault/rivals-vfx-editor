@@ -138,6 +138,20 @@ export function SaveModModal({
     );
   };
 
+  // Quick Action: Create a new bundle group
+  const handleCreateNewBundle = () => {
+    const group = window.prompt('Enter new Bundle Archive name (e.g. FantasticDuo_VFX or MartialArts_VFX):');
+    if (!group) return;
+    const cleanGroup = group.trim().replace(/\s+/g, '_');
+    setSlotConfigs(prev => {
+      const firstSolo = prev.find(s => s.exportMode === 'solo');
+      if (firstSolo) {
+        return prev.map(s => (s.slotId === firstSolo.slotId ? { ...s, exportMode: 'bundle', bundleGroup: cleanGroup } : s));
+      }
+      return prev;
+    });
+  };
+
   const handleStartExport = () => {
     if (!exportIoStore && !exportRawUassets && !exportJson && !exportRvfxpPreset) {
       alert('Please select at least one output format to export.');
@@ -178,7 +192,7 @@ export function SaveModModal({
             <div>
               <h3 className="text-base font-bold tracking-wider uppercase" style={{ color: 'var(--text-1)' }}>
                 {isBatch
-                  ? `Selective Export Matrix (${slotConfigs.length} Slots Loaded)`
+                  ? `Selective Mod Export (${slotConfigs.length} Slots Loaded)`
                   : `Export Mod: ${slotConfigs[0]?.customLabel || initialModName}`}
               </h3>
               <p className="text-xs font-mono" style={{ color: 'var(--text-4)' }}>
@@ -334,12 +348,12 @@ export function SaveModModal({
             </div>
           </div>
 
-          {/* Section 3: Batch Export Matrix Table */}
+          {/* Section 3: Batch Export Table */}
           {isBatch && slotConfigs.length > 0 ? (
             <div className="space-y-2">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
                 <span className="text-xs font-bold uppercase tracking-wider text-[var(--accent-main)]">
-                  3. Batch Matrix: Solo Mods & Bundle Groups
+                  3. Solo Mods & Bundle Groups
                 </span>
                 <div className="flex items-center gap-2">
                   <button
@@ -357,6 +371,14 @@ export function SaveModModal({
                     style={{ backgroundColor: 'var(--bg-1)', borderColor: 'var(--bg-1)', color: 'var(--text-2)' }}
                   >
                     Bundle All Together...
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleCreateNewBundle}
+                    className="px-2.5 py-1 text-xs font-medium border transition-colors hover:bg-amber-500/20"
+                    style={{ backgroundColor: 'rgba(245, 158, 11, 0.15)', borderColor: 'rgba(245, 158, 11, 0.4)', color: '#fbbf24' }}
+                  >
+                    + New Bundle...
                   </button>
                 </div>
               </div>
@@ -389,7 +411,8 @@ export function SaveModModal({
                             value={slot.customLabel}
                             onChange={e => handleUpdateSlotLabel(slot.slotId, e.target.value)}
                             placeholder="e.g. IronFist_Red_VFX"
-                            className="w-full bg-black/40 border border-gray-700 focus:border-[var(--accent-main)] px-2 py-1 text-xs text-white outline-none font-mono"
+                            className="w-full border px-2 py-1 text-xs outline-none font-mono"
+                            style={{ backgroundColor: 'var(--bg-4)', borderColor: 'var(--bg-1)', color: 'var(--text-1)' }}
                           />
                         </td>
                         <td className="py-2 px-3 whitespace-nowrap">
@@ -427,7 +450,8 @@ export function SaveModModal({
                                 value={slot.bundleGroup}
                                 onChange={e => handleUpdateSlotBundle(slot.slotId, e.target.value)}
                                 placeholder="e.g. FantasticDuo_VFX"
-                                className="w-full bg-black/40 border border-amber-500/50 focus:border-amber-400 px-2 py-1 text-xs text-amber-200 outline-none font-mono"
+                                className="w-full border px-2 py-1 text-xs outline-none font-mono"
+                                style={{ backgroundColor: 'var(--bg-4)', borderColor: '#f59e0b', color: '#fef3c7' }}
                               />
                               <span className="text-gray-500 font-mono text-[10px]">.zip</span>
                             </div>
@@ -459,7 +483,8 @@ export function SaveModModal({
                   value={slotConfigs[0]?.customLabel || ''}
                   onChange={e => handleUpdateSlotLabel(slotConfigs[0]?.slotId || 'single_active', e.target.value)}
                   placeholder="e.g. IronFist_Red_VFX"
-                  className="flex-1 bg-black/40 border border-gray-700 focus:border-[var(--accent-main)] px-3 py-1.5 text-xs text-white outline-none font-mono"
+                  className="flex-1 border px-3 py-1.5 text-xs outline-none font-mono"
+                  style={{ backgroundColor: 'var(--bg-4)', borderColor: 'var(--bg-1)', color: 'var(--text-1)' }}
                 />
               </div>
             </div>
@@ -477,20 +502,20 @@ export function SaveModModal({
               {isBatch ? (
                 <>
                   <p>
-                    • Total Mods: <strong className="text-white">{slotConfigs.length}</strong> ({soloCount} Solo Mods,{' '}
-                    {distinctBundleNames.length} Bundle Archives)
+                    • Total Mods: <strong className="text-white">{slotConfigs.length}</strong> ({soloCount} Solo Mod{soloCount === 1 ? '' : 's'},{' '}
+                    {distinctBundleNames.length} Bundle Archive{distinctBundleNames.length === 1 ? '' : 's'})
                   </p>
                   {distinctBundleNames.length > 0 && (
-                    <div className="pl-4 space-y-0.5 text-amber-300/90 font-mono text-[11px]">
+                    <div className="pl-2 space-y-1 font-mono text-[11px]">
                       {distinctBundleNames.map(bg => (
-                        <p key={bg}>
-                          📁 <strong>{bg}.zip</strong>: contains {bundleMap[bg].length} mods ({bundleMap[bg].join(', ')})
-                        </p>
+                        <div key={bg} className="p-1.5 rounded border border-amber-500/30 bg-amber-500/10 text-amber-200">
+                          📁 <strong>{bg}.zip</strong>: contains {bundleMap[bg].length} mod{bundleMap[bg].length === 1 ? '' : 's'} ({bundleMap[bg].join(', ')})
+                        </div>
                       ))}
                     </div>
                   )}
                   {soloCount > 0 && (
-                    <p className="pl-4 text-gray-400 font-mono text-[11px]">
+                    <p className="pl-2 text-gray-400 font-mono text-[11px]">
                       📄 {soloCount} Solo Mod(s) exported individually into their own folders
                     </p>
                   )}

@@ -2409,7 +2409,14 @@ async fn extract_hero_vfx(
 
     if has_uassets {
         eprintln!("[DEBUG] Hero assets already extracted, skipping extraction but re-converting to JSON...");
+        telemetry::log_info(format!("[Hero {}] Assets already cached, preparing JSON conversion...", hero_id));
     } else {
+        telemetry::log_info(format!(
+            "[Hero {}] Extracting {} assets from game IoStore containers...",
+            hero_id,
+            if is_ko { "KO prompt" } else { "combat VFX" }
+        ));
+
         // Step 1: Extract VFX materials via CLI
         fs::create_dir_all(&extract_dir).map_err(|e| e.to_string())?;
 
@@ -3524,6 +3531,7 @@ async fn list_game_assets(
         "[DEBUG] Indexing {} top-level IoStore containers (mod subfolders such as ~mods are skipped)...",
         utocs.len()
     );
+    telemetry::log_info(format!("[IoStore Index] Indexing {} game containers (mod subfolders are skipped)...", utocs.len()));
 
     let container_count = utocs.len();
     let mut seen: HashSet<String> = HashSet::new();
@@ -3554,6 +3562,7 @@ async fn list_game_assets(
                         }
                     }
                     reused += 1;
+                    telemetry::log_info(format!("[IoStore Index] Container {}/{}: {} (reused {} cached materials)", i + 1, container_count, container_name, entry.assets.len()));
                     fresh_entries.push(CachedContainer {
                         name: container_name.clone(),
                         size,
@@ -3578,6 +3587,7 @@ async fn list_game_assets(
             },
         );
 
+        telemetry::log_info(format!("[IoStore Index] Container {}/{}: scanning {} via UAssetTool...", i + 1, container_count, container_name));
         let proc = get_or_spawn_tool(&mut process_guard, &tool_path).await?;
         // type_filter implies include_types, and game_paks locates global.utoc for
         // the script objects. The tool filters, so `files` comes back holding
@@ -3681,6 +3691,12 @@ async fn list_game_assets(
         reused,
         container_count - reused
     );
+    telemetry::log_info(format!(
+        "[IoStore Index] Completed: {} browsable materials indexed across {} containers ({} reused from cache)",
+        assets.len(),
+        container_count,
+        reused
+    ));
 
     let _ = app.emit(
         "conversion-progress",
@@ -3765,6 +3781,8 @@ async fn extract_manual_assets(
     fs::create_dir_all(&extract_dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&json_dir).map_err(|e| e.to_string())?;
 
+    telemetry::log_info(format!("[Manual Extraction] Starting extraction of {} queued assets from game containers...", asset_paths.len()));
+
     let _ = app.emit(
         "conversion-progress",
         ConversionProgress {
@@ -3814,6 +3832,7 @@ async fn extract_manual_assets(
         uasset_files.len(),
         asset_paths.len()
     );
+    telemetry::log_info(format!("[Manual Extraction] Extracted {}/{} queued assets to staging cache", uasset_files.len(), asset_paths.len()));
 
     let total = uasset_files.len();
     let _ = app.emit(
@@ -3886,6 +3905,8 @@ async fn extract_manual_assets(
                 .unwrap_or_default(),
         );
     }
+
+    telemetry::log_info(format!("[Manual Extraction] Batch JSON conversion finished: {} assets converted", json_paths.len()));
 
     let _ = app.emit(
         "conversion-progress",
@@ -4226,6 +4247,7 @@ async fn create_bundle_zip(
     }
 
     create_zip_archive(&zip_path, &entries)?;
+    telemetry::log_info(format!("[Bundle ZIP] Created bundle archive: {} ({} files)", zip_path.display(), entries.len()));
     Ok(zip_path.to_string_lossy().to_string())
 }
 
@@ -4284,6 +4306,7 @@ async fn package_iostore_mod(
         let _ = fs::remove_dir_all(&stage_root);
         return Err("No valid JSON files could be staged for mod packaging".to_string());
     }
+    telemetry::log_info(format!("[Mod Packaging] Staged {} JSON files for mod '{}'", staged_json_files.len(), mod_name));
 
     // Step 2: Convert staged JSONs to .uasset in stage_root
     let (usmap_path, tool_path) = {
@@ -4398,6 +4421,7 @@ async fn package_iostore_mod(
             },
         );
 
+        telemetry::log_info(format!("[Mod Packaging] Creating IoStore containers for mod '{}' via UAssetTool...", mod_name));
         let (stdout, stderr) = run_uasset_tool_cli(&tool_path, &cli_args_refs).await?;
         eprintln!("[DEBUG] create_mod_iostore stdout: {}", stdout);
         if !stderr.is_empty() {
@@ -4444,6 +4468,7 @@ async fn package_iostore_mod(
             }
         }
 
+        telemetry::log_info(format!("[Mod Packaging] Successfully packaged '{}' (IoStore .utoc/.ucas/.pak created)", mod_name));
         result.message = Some(format!(
             "Successfully packaged {} into game-ready IoStore mod (3 files: .utoc, .ucas, .pak)",
             mod_name

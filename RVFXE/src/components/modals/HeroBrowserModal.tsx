@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { HeroEntry, BatchHeroSlot } from '@/types';
 import * as tauri from '@/services/tauri';
+import { toPascalCaseHeroName } from '@/utils/helpers';
 
 // Module-level cache so icon data URLs persist across modal open/close cycles
 const iconDataUrlCache: Record<string, string> = {};
@@ -152,7 +153,8 @@ export function HeroBrowserModal({ onClose, onSelectHero, onBatchLoadHeroes, add
 
   const addToBatchQueue = (hero: HeroEntry) => {
     const existingCount = batchQueue.filter(s => s.heroId === hero.hero_id).length;
-    const label = existingCount > 0 ? `${hero.display_name} (Variant ${existingCount + 1})` : hero.display_name;
+    const pascalName = toPascalCaseHeroName(hero.display_name);
+    const label = existingCount > 0 ? `${pascalName}_Variant${existingCount + 1}_VFX` : `${pascalName}_VFX`;
     setBatchQueue(prev => [
       ...prev,
       {

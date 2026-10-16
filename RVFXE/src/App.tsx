@@ -17,7 +17,7 @@ import {
   inferRecipeFromLegacySession,
   applyRecipeToParams,
 } from '@/utils/color';
-import { setNestedValue, getFileName, normalizePath, pathsMatchSuffix, getPakReadyRelativePath } from '@/utils/helpers';
+import { setNestedValue, getFileName, normalizePath, pathsMatchSuffix, getPakReadyRelativePath, toPascalCaseHeroName } from '@/utils/helpers';
 import { parseJsonAndExtractColors } from '@/services/colorParser';
 import * as tauri from '@/services/tauri';
 import { Header } from '@/components/Header';
@@ -184,6 +184,25 @@ export function App() {
     });
     return () => { unlistenPromise.then((unlisten: () => void) => unlisten()); };
   }, []);
+
+  // === REFRESH CACHE STATS WHEN SETTINGS MODAL OPENS ===
+  useEffect(() => {
+    if (showSettings) {
+      Promise.all([
+        tauri.getHeroBrowserCacheInfo(),
+        tauri.getVfxCacheInfo(),
+        tauri.getManualCacheInfo(),
+      ])
+        .then(([hb, vfx, manual]) => {
+          setHeroBrowserCacheInfo({ fileCount: hb.file_count, totalSizeBytes: hb.total_size_bytes });
+          setVfxCacheInfo({ fileCount: vfx.file_count, totalSizeBytes: vfx.total_size_bytes });
+          setManualCacheInfo({ fileCount: manual.file_count, totalSizeBytes: manual.total_size_bytes });
+        })
+        .catch(err => {
+          console.error('[App] Failed to fetch cache info:', err);
+        });
+    }
+  }, [showSettings]);
 
   // === LOAD SETTINGS FROM BACKEND ===
   useEffect(() => {
@@ -779,7 +798,9 @@ export function App() {
           }
         }
 
-        const cleanLabel = slot.customLabel.replace(/\s+/g, '_') + (slot.customLabel.toLowerCase().includes('vfx') ? '' : '_VFX');
+        const cleanLabel = slot.customLabel.toLowerCase().includes('vfx')
+          ? `${toPascalCaseHeroName(slot.customLabel.replace(/_?vfx/i, ''))}_VFX`
+          : `${toPascalCaseHeroName(slot.customLabel)}_VFX`;
 
         preparedSlots.push({
           slotId: slot.slotId,
@@ -1208,9 +1229,9 @@ export function App() {
             }),
             savedParameters: [],
           };
-          const projectPresetPath = `${outputPath}/BatchMatrix_Project_${Date.now()}.rvfxp`;
+          const projectPresetPath = `${outputPath}/Batch_Project_${Date.now()}.rvfxp`;
           await tauri.writeTextFile(projectPresetPath, JSON.stringify(batchProjectPreset, null, 2));
-          debug.addLog(`✓ Exported workspace matrix preset to ${projectPresetPath}`);
+          debug.addLog(`✓ Exported workspace preset to ${projectPresetPath}`);
         }
 
         // Sync custom labels and bundle groups back into batchSlots in React state
@@ -1230,7 +1251,7 @@ export function App() {
 
         setSaveStatus(`All ${totalSlots} mod outputs packaged successfully!`);
         await tauri.openFolder(outputPath);
-        debug.addLog(`✓ Export Matrix completed: ${totalSlots} mods in ${outputPath}`);
+        debug.addLog(`✓ Batch mod packaging completed: ${totalSlots} mods in ${outputPath}`);
       }
     } catch (err: any) {
       alert(`Save error: ${err.message || err}`);
@@ -1509,8 +1530,8 @@ export function App() {
   }, [pendingRvfxp, currentHeroId, debug, fetchHeroVfxData, setInitialHistory]);
 
   // === EXPORT CURRENT SESSION FILE (VERSION 2 RECIPE PRESET & MASTER WORKSPACE PROFILES) ===
-  const handleExportSession = useCallback(async () => {
-    const isWorkspace = isBatchMode && batchSlots.length > 1;
+  const handleExportSession = useCallback(async (exportAllSlots = false) => {
+    const isWorkspace = exportAllSlots && isBatchMode && batchSlots.length > 1;
 
     let presetV2: RvfxpPresetV2;
     let defaultFileName: string;
@@ -1896,31 +1917,78 @@ export function App() {
               onExtract={async (paths) => {
                 setShowManualExtraction(false);
                 setIsConverting(true);
+                tauri.logFrontendMessage('INFO', `[Manual Extraction] Starting extraction of ${paths.length} assets...`).catch(() => {});
+
                 const result = await tauri.extractManualAssets(paths);
-                const fileObjs: FileObject[] = [];
+                const totalFiles = result.json_paths.length;
+                tauri.logFrontendMessage('INFO', `[Manual Extraction] Extracted ${totalFiles} assets. Parsing color parameters in chunks...`).catch(() => {});
+
                 const srcMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
-                for (let i = 0; i < result.json_paths.length; i++) {
-                  const content = await tauri.readTextFile(result.json_paths[i]);
-                  const name = result.json_paths[i].split(/[\\/]/).pop() || '';
-                  const rel = result.json_paths[i].replace(/\\/g, '/').split('/Content/').pop() || name;
-                  fileObjs.push({ name, content, relativePath: rel });
-                  srcMap[rel] = { uassetPath: result.uasset_paths[i], jsonPath: result.json_paths[i] };
+                const freshParams: ColorParam[] = [];
+                const unusedJsonPaths: string[] = [];
+                const unusedUassetPaths: string[] = [];
+
+                for (let i = 0; i < totalFiles; i++) {
+                  const jsonPath = result.json_paths[i];
+                  const uassetPath = result.uasset_paths[i] || '';
+                  const name = jsonPath.split(/[\\/]/).pop() || '';
+                  const rel = jsonPath.replace(/\\/g, '/').split('/Content/').pop() || name;
+                  srcMap[rel] = { uassetPath, jsonPath };
+
+                  const prevCount = freshParams.length;
+                  try {
+                    const content = await tauri.readTextFile(jsonPath);
+                    const json = JSON.parse(content);
+                    parseJsonAndExtractColors(json, name, rel, freshParams, filterDictionary, debug.addLog);
+                  } catch (e) {}
+
+                  if (freshParams.length === prevCount) {
+                    unusedJsonPaths.push(jsonPath);
+                    if (uassetPath) unusedUassetPaths.push(uassetPath);
+                    delete srcMap[rel];
+                  }
+
+                  // Yield to GC and update progress every 40 files
+                  if (i > 0 && i % 40 === 0) {
+                    setConversionProgress({
+                      current: i,
+                      total: totalFiles,
+                      fileName: `Parsing materials (${i}/${totalFiles})...`,
+                    });
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                  }
+
+                  // Log to console periodically
+                  if (i > 0 && i % 2500 === 0) {
+                    tauri.logFrontendMessage('INFO', `[Manual Extraction] Parsed ${i}/${totalFiles} materials (${freshParams.length} color params found)...`).catch(() => {});
+                  }
                 }
+
+                // Prune non-color materials from cache to keep disk clean
+                if (unusedJsonPaths.length > 0 || unusedUassetPaths.length > 0) {
+                  tauri.pruneUnusedHeroAssets(unusedJsonPaths, unusedUassetPaths).catch(() => {});
+                }
+
+                tauri.logFrontendMessage(
+                  'INFO',
+                  `[Manual Extraction] Done: ${freshParams.length} color params across ${totalFiles - unusedJsonPaths.length} active materials (${unusedJsonPaths.length} non-color assets pruned)`
+                ).catch(() => {});
+
                 setUassetSourceMap(srcMap);
                 setOriginalFiles({});
-                const freshParams: ColorParam[] = [];
-                const freshFiles: Record<string, any> = {};
-                fileObjs.forEach(f => {
-                  try {
-                    const json = JSON.parse(f.content);
-                    freshFiles[f.relativePath] = json;
-                    parseJsonAndExtractColors(json, f.name, f.relativePath, freshParams, filterDictionary, debug.addLog);
-                  } catch (e) {}
-                });
-                setOriginalFiles(freshFiles);
                 setInitialHistory(freshParams);
                 setSelectedParams(new Set(freshParams.map(p => p.id)));
+
+                // Populate folders
+                const uniqueFolders = [...new Set(freshParams.map(p => {
+                  const lastSlash = p.relativePath.lastIndexOf('/');
+                  return lastSlash > 0 ? p.relativePath.substring(0, lastSlash) : '/';
+                }))];
+                setFolders(uniqueFolders.sort());
+                setSelectedFolders(new Set(uniqueFolders));
+
                 setIsConverting(false);
+                setConversionProgress({ current: 0, total: 0, fileName: '' });
               }}
               addDebugLog={debug.addLog}
             />
@@ -2026,9 +2094,20 @@ export function App() {
                           <button onClick={handleImportSession} title="Import Project (.rvfxp)" className="flex items-center justify-center w-8 h-8 rounded-none transition-colors shadow-md ml-2" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }}>
                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
                           </button>
-                          <button onClick={handleExportSession} title="Export Selected to Project (.rvfxp)" className="flex items-center justify-center w-8 h-8 rounded-none transition-colors shadow-md" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }}>
+                          <button onClick={() => handleExportSession(false)} title="Export Selected Slot to Project (.rvfxp)" className="flex items-center justify-center w-8 h-8 rounded-none transition-colors shadow-md" style={{ backgroundColor: 'var(--bg-1)', color: 'var(--text-1)' }}>
                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></svg>
                           </button>
+                          {isBatchMode && batchSlots.length > 1 && (
+                            <button
+                              onClick={() => handleExportSession(true)}
+                              title={`Export All ${batchSlots.length} Slots to Master Workspace Profile (.rvfxp)`}
+                              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-none transition-colors shadow-md ml-1"
+                              style={{ backgroundColor: 'rgba(6, 182, 212, 0.15)', borderColor: 'rgba(6, 182, 212, 0.4)', color: '#22d3ee' }}
+                            >
+                              <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></svg>
+                              <span>Export All ({batchSlots.length})</span>
+                            </button>
+                          )}
                         </div>
 
                         <div className="flex items-center gap-2 w-full sm:w-auto justify-end">

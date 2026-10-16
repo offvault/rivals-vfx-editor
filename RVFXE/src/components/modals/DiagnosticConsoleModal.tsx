@@ -115,7 +115,7 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
   }, [onClose]);
 
   return (
-    <div className="fixed inset-0 pointer-events-none z-50 overflow-hidden select-none">
+    <div className="fixed inset-0 pointer-events-none z-[100] overflow-hidden select-none">
       <div
         className="pointer-events-auto absolute flex flex-col border border-cyan-500/40 shadow-2xl overflow-hidden font-mono text-xs rounded-lg"
         style={{

@@ -86,3 +86,20 @@ export function getPakReadyRelativePath(filePath: string, modFolderName: string)
   }
   return `${cleanMod}/Marvel/Content/${subPath}`;
 }
+
+/**
+ * Convert raw hero name strings (e.g. "THE HOOD", "IRON FIST", "GORR THE GOD BUTCHER")
+ * into clean PascalCase identifiers (e.g. "TheHood", "IronFist", "GorrTheGodButcher").
+ */
+export function toPascalCaseHeroName(rawName: string): string {
+  if (!rawName) return 'Hero';
+  const words = rawName
+    .replace(/[^\w\s-]/g, '')
+    .split(/[\s_-]+/)
+    .filter(Boolean);
+  if (words.length === 0) return 'Hero';
+  return words
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join('');
+}
+

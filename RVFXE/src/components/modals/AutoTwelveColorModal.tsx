@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { ColorParam, RGBA, UassetSourceMap, RvfxpPresetV2 } from '@/types';
 import * as tauri from '@/services/tauri';
 import { hexToRgba, applyColorToParam, isEnemyParameter } from '@/utils/color';
-import { setNestedValue, getPakReadyRelativePath } from '@/utils/helpers';
+import { setNestedValue, getPakReadyRelativePath, toPascalCaseHeroName } from '@/utils/helpers';
 
 export interface AutoTwelveColorModalProps {
   heroId: string;
@@ -61,7 +61,7 @@ export function AutoTwelveColorModal({
   const [currentStep, setCurrentStep] = useState('');
   const [progressPercent, setProgressPercent] = useState(0);
 
-  const cleanHeroName = heroName.replace(/\s+/g, '_');
+  const cleanHeroName = toPascalCaseHeroName(heroName);
 
   const handleSelectOutput = async () => {
     try {

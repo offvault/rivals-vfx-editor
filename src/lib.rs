@@ -154,6 +154,10 @@ pub struct UsmapStatus {
     pub needs_update: bool,
     pub latest_remote: Option<String>,
     pub auto_managed: bool,
+    pub current_build: Option<String>,
+    pub latest_build: Option<String>,
+    pub season: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -217,6 +221,46 @@ pub struct AppState {
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+
+/// Instantly wipes a directory by performing an atomic O(1) rename to a trash
+/// folder in temp, recreating the clean directory immediately, and deleting the
+/// contents asynchronously in the background so the UI never freezes.
+fn instant_wipe_dir(dir: &Path) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let trash_name = format!("rvfx_trash_{}_{}", std::process::id(), timestamp);
+    let trash_dir = std::env::temp_dir().join(trash_name);
+
+    let renamed = fs::rename(dir, &trash_dir).is_ok();
+    let _ = fs::create_dir_all(dir);
+
+    let target_to_delete = if renamed { trash_dir } else { dir.to_path_buf() };
+
+    std::thread::Builder::new()
+        .name("rvfx-cache-wiper".to_string())
+        .spawn(move || {
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                let _ = std::process::Command::new("cmd")
+                    .args(&["/c", "rd", "/s", "/q"])
+                    .arg(&target_to_delete)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .status();
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = fs::remove_dir_all(&target_to_delete);
+            }
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
 
 fn get_cache_dir() -> PathBuf {
     let temp_dir = std::env::temp_dir();
@@ -686,9 +730,7 @@ fn get_cache_info() -> CacheInfo {
 #[tauri::command]
 fn clear_cache(state: State<AppState>) -> Result<(), String> {
     let cache_dir = get_cache_dir();
-    if cache_dir.exists() {
-        fs::remove_dir_all(&cache_dir).map_err(|e| e.to_string())?;
-    }
+    instant_wipe_dir(&cache_dir)?;
 
     let mut cache_index = state.cache_index.lock().unwrap();
     cache_index.entries.clear();
@@ -778,9 +820,9 @@ fn clear_hero_browser_cache() -> Result<(), String> {
         let path = cache_dir.join(entry_name);
         if path.exists() {
             if path.is_dir() {
-                fs::remove_dir_all(path).map_err(|e| e.to_string())?;
+                let _ = instant_wipe_dir(&path);
             } else {
-                fs::remove_file(&path).map_err(|e| e.to_string())?;
+                let _ = fs::remove_file(&path);
             }
         }
     }
@@ -790,9 +832,7 @@ fn clear_hero_browser_cache() -> Result<(), String> {
 #[tauri::command]
 fn clear_vfx_cache() -> Result<(), String> {
     let vfx_dir = get_hero_cache_dir().join("vfx");
-    if vfx_dir.exists() {
-        fs::remove_dir_all(&vfx_dir).map_err(|e| e.to_string())?;
-    }
+    instant_wipe_dir(&vfx_dir)?;
     Ok(())
 }
 
@@ -2359,12 +2399,8 @@ async fn extract_hero_vfx(
 
     if should_force {
         eprintln!("[DEBUG] force_refresh requested: clearing cached extracted and json dirs for hero {}", hero_id);
-        if extract_dir.exists() {
-            let _ = fs::remove_dir_all(&extract_dir);
-        }
-        if json_dir.exists() {
-            let _ = fs::remove_dir_all(&json_dir);
-        }
+        let _ = instant_wipe_dir(&extract_dir);
+        let _ = instant_wipe_dir(&json_dir);
     }
 
     // Check if already extracted
@@ -2411,6 +2447,16 @@ async fn extract_hero_vfx(
             cli_args.push(format!("Marvel/UI/Blueprints/Battle/Custom/{}", hero_id));
         } else {
             cli_args.push(format!("VFX/Materials/Characters/{}/", hero_id));
+            cli_args.push("--exclude".to_string());
+            cli_args.push("MVP".to_string());
+            cli_args.push("Celebration".to_string());
+            cli_args.push("Lobby".to_string());
+            cli_args.push("ShowFigure".to_string());
+            cli_args.push("Show".to_string());
+            cli_args.push("Emote".to_string());
+            cli_args.push("Gallery".to_string());
+            cli_args.push("Select".to_string());
+            cli_args.push("Pose".to_string());
         }
 
         let cli_args_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
@@ -2531,6 +2577,43 @@ async fn extract_hero_vfx(
         cached: false,
         error: None,
     })
+}
+
+#[tauri::command]
+async fn prune_unused_hero_assets(
+    json_paths: Vec<String>,
+    uasset_paths: Vec<String>,
+) -> Result<usize, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut count = 0;
+        for jp in json_paths {
+            let p = PathBuf::from(jp);
+            if p.exists() && fs::remove_file(&p).is_ok() {
+                count += 1;
+            }
+        }
+        for up in uasset_paths {
+            let uasset = PathBuf::from(&up);
+            if uasset.exists() && fs::remove_file(&uasset).is_ok() {
+                count += 1;
+            }
+            let uexp = uasset.with_extension("uexp");
+            if uexp.exists() && fs::remove_file(&uexp).is_ok() {
+                count += 1;
+            }
+            let ubulk = uasset.with_extension("ubulk");
+            if ubulk.exists() {
+                let _ = fs::remove_file(&ubulk);
+            }
+            let uptnl = uasset.with_extension("uptnl");
+            if uptnl.exists() {
+                let _ = fs::remove_file(&uptnl);
+            }
+        }
+        count
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Recursively find first file matching a name pattern in a directory.
@@ -2929,6 +3012,35 @@ async fn fetch_latest_usmap_filename() -> Result<String, String> {
         .ok_or_else(|| "No usmap files found in repository".to_string())
 }
 
+fn parse_usmap_info(filename: &str) -> (Option<String>, Option<String>) {
+    let clean = filename.trim();
+    // Build number: e.g. "5.3.2-3939753+++" or "5.3.2-3312577+++"
+    let build = if let Some(dash_idx) = clean.find('-') {
+        let after_dash = &clean[dash_idx + 1..];
+        if let Some(plus_idx) = after_dash.find('+') {
+            Some(after_dash[..plus_idx].to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Season: e.g. "+S10.5_" or "+S7.5_" or "Season"
+    let season = if let Some(s_idx) = clean.find("+S") {
+        let after_s = &clean[s_idx + 1..];
+        if let Some(us_idx) = after_s.find('_') {
+            Some(after_s[..us_idx].to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    (build, season)
+}
+
 #[tauri::command]
 async fn check_usmap_status(state: State<'_, AppState>) -> Result<UsmapStatus, String> {
     let settings_usmap = {
@@ -2958,34 +3070,120 @@ async fn check_usmap_status(state: State<'_, AppState>) -> Result<UsmapStatus, S
         .map(|p| Path::new(p).exists())
         .unwrap_or(false);
 
+    let current_file_name = meta.as_ref().map(|m| m.file_name.clone()).or_else(|| {
+        settings_usmap.as_ref().and_then(|p| {
+            Path::new(p).file_name().map(|f| f.to_string_lossy().to_string())
+        })
+    });
+
+    let (current_build, current_season) = current_file_name
+        .as_deref()
+        .map(parse_usmap_info)
+        .unwrap_or((None, None));
+
     // Try to fetch latest remote filename
     let latest_remote = fetch_latest_usmap_filename().await.ok();
+    let (latest_build, remote_season) = latest_remote
+        .as_deref()
+        .map(parse_usmap_info)
+        .unwrap_or((None, None));
 
-    let needs_update = if let (Some(ref remote), Some(ref m)) = (&latest_remote, &meta) {
-        *remote != m.file_name
-    } else if latest_remote.is_some() && meta.is_none() {
+    let needs_update = if let (Some(ref remote), Some(ref cur)) = (&latest_build, &current_build) {
+        remote != cur
+    } else if latest_remote.is_some() && !installed {
         true
     } else {
         false
     };
 
+    let message = if !installed {
+        Some("No .usmap installed".to_string())
+    } else if needs_update {
+        Some(format!(
+            "New build available: {} -> {}",
+            current_build.as_deref().unwrap_or("?"),
+            latest_build.as_deref().unwrap_or("?")
+        ))
+    } else {
+        let b = current_build.as_deref().unwrap_or("latest");
+        let s = current_season.as_ref().or(remote_season.as_ref()).map(|v| v.as_str()).unwrap_or("");
+        Some(if s.is_empty() {
+            format!("Up to date: build {}", b)
+        } else {
+            format!("Up to date: build {} ({})", b, s)
+        })
+    };
+
     Ok(UsmapStatus {
         installed,
-        file_name: meta.as_ref().map(|m| m.file_name.clone()).or_else(|| {
-            settings_usmap.as_ref().and_then(|p| {
-                Path::new(p).file_name().map(|f| f.to_string_lossy().to_string())
-            })
-        }),
+        file_name: current_file_name,
         file_path: settings_usmap,
         needs_update,
         latest_remote,
         auto_managed,
+        current_build,
+        latest_build,
+        season: current_season.or(remote_season),
+        message,
     })
 }
 
 #[tauri::command]
 async fn fetch_latest_usmap(state: State<'_, AppState>) -> Result<UsmapStatus, String> {
+    let settings_usmap = {
+        let settings = state.settings.lock().unwrap();
+        settings.usmap_path.clone()
+    };
+
+    let current_file_name = settings_usmap.as_ref().and_then(|p| {
+        Path::new(p).file_name().map(|f| f.to_string_lossy().to_string())
+    });
+
+    let (current_build, current_season) = current_file_name
+        .as_deref()
+        .map(parse_usmap_info)
+        .unwrap_or((None, None));
+
     let file_name = fetch_latest_usmap_filename().await?;
+    let (remote_build, remote_season) = parse_usmap_info(&file_name);
+
+    let managed_dir = get_usmap_dir();
+    let usmap_path = managed_dir.join(&file_name);
+    let usmap_path_str = usmap_path.to_string_lossy().to_string();
+
+    let already_has_file = settings_usmap
+        .as_ref()
+        .map(|p| Path::new(p).exists())
+        .unwrap_or(false);
+
+    if already_has_file
+        && current_build.is_some()
+        && remote_build.is_some()
+        && current_build == remote_build
+    {
+        let b = remote_build.as_deref().unwrap_or("latest");
+        let s = remote_season.as_deref().or(current_season.as_deref()).unwrap_or("");
+        let msg = if s.is_empty() {
+            format!("Already up to date: build {}", b)
+        } else {
+            format!("Already up to date: build {} ({})", b, s)
+        };
+        eprintln!("[DEBUG] Usmap is already up to date: {}", msg);
+
+        return Ok(UsmapStatus {
+            installed: true,
+            file_name: current_file_name,
+            file_path: settings_usmap,
+            needs_update: false,
+            latest_remote: Some(file_name),
+            auto_managed: true,
+            current_build,
+            latest_build: remote_build,
+            season: remote_season.or(current_season),
+            message: Some(msg),
+        });
+    }
+
     let download_url = format!(
         "https://raw.githubusercontent.com/SpaceDepot/rivals-depot/main/usmap/{}",
         file_name
@@ -3009,16 +3207,13 @@ async fn fetch_latest_usmap(state: State<'_, AppState>) -> Result<UsmapStatus, S
         .await
         .map_err(|e| format!("Failed to read usmap data: {}", e))?;
 
-    let usmap_dir = get_usmap_dir();
-    fs::create_dir_all(&usmap_dir).map_err(|e| format!("Failed to create mappings dir: {}", e))?;
-
-    let usmap_path = usmap_dir.join(&file_name);
+    fs::create_dir_all(&managed_dir).map_err(|e| format!("Failed to create mappings dir: {}", e))?;
     fs::write(&usmap_path, &bytes).map_err(|e| format!("Failed to write usmap file: {}", e))?;
 
     // Save metadata
     let meta = UsmapMeta {
         file_name: file_name.clone(),
-        file_path: usmap_path.to_string_lossy().to_string(),
+        file_path: usmap_path_str.clone(),
         fetched_at: chrono::Utc::now().to_rfc3339(),
     };
     let meta_json =
@@ -3027,12 +3222,20 @@ async fn fetch_latest_usmap(state: State<'_, AppState>) -> Result<UsmapStatus, S
         .map_err(|e| format!("Failed to write meta file: {}", e))?;
 
     // Update app settings to point to the new usmap
-    let usmap_path_str = usmap_path.to_string_lossy().to_string();
     {
         let mut settings = state.settings.lock().unwrap();
         settings.usmap_path = Some(usmap_path_str.clone());
         save_settings(&settings).map_err(|e| format!("Failed to save settings: {}", e))?;
     }
+
+    let from_b = current_build.as_deref().unwrap_or("none");
+    let to_b = remote_build.as_deref().unwrap_or("latest");
+    let s = remote_season.as_deref().unwrap_or("");
+    let msg = if s.is_empty() {
+        format!("Updated from build {} to build {}", from_b, to_b)
+    } else {
+        format!("Updated from build {} to build {} ({})", from_b, to_b, s)
+    };
 
     eprintln!("[DEBUG] Usmap installed: {} -> {:?}", file_name, usmap_path);
 
@@ -3043,6 +3246,10 @@ async fn fetch_latest_usmap(state: State<'_, AppState>) -> Result<UsmapStatus, S
         needs_update: false,
         latest_remote: None,
         auto_managed: true,
+        current_build: Some(to_b.to_string()),
+        latest_build: Some(to_b.to_string()),
+        season: remote_season,
+        message: Some(msg),
     })
 }
 
@@ -3747,9 +3954,7 @@ fn get_manual_cache_info() -> CacheInfo {
 fn clear_manual_cache() -> Result<(), String> {
     let cache_dir = get_manual_cache_dir();
     eprintln!("[DEBUG] Clearing manual extraction cache: {:?}", cache_dir);
-    if cache_dir.exists() {
-        fs::remove_dir_all(&cache_dir).map_err(|e| e.to_string())?;
-    }
+    instant_wipe_dir(&cache_dir)?;
     Ok(())
 }
 
@@ -4317,6 +4522,7 @@ pub fn run() {
             update_vfx_mod,
             package_iostore_mod,
             create_bundle_zip,
+            prune_unused_hero_assets,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -4331,9 +4537,8 @@ pub fn run() {
                 if should_clear {
                     // Clear VFX materials cache
                     let vfx_dir = get_hero_cache_dir().join("vfx");
-                    if vfx_dir.exists() {
-                        let _ = fs::remove_dir_all(&vfx_dir);
-                    }
+                    let _ = instant_wipe_dir(&vfx_dir);
+
                     // Clear conversion cache (JSON files) but preserve hero browser data
                     let cache_dir = get_cache_dir();
                     let mut cache_index = state.cache_index.lock().unwrap();
@@ -4348,7 +4553,7 @@ pub fn run() {
                                 continue;
                             }
                             if path.is_dir() {
-                                let _ = fs::remove_dir_all(&path);
+                                let _ = instant_wipe_dir(&path);
                             } else {
                                 let _ = fs::remove_file(&path);
                             }

@@ -276,6 +276,9 @@ export function App() {
     const totalFiles = res.json_paths.length;
     tauri.logFrontendMessage('INFO', `[Hero ${heroId}] Parsing ${totalFiles} material JSONs...`).catch(() => {});
 
+    const unusedJsonPaths: string[] = [];
+    const unusedUassetPaths: string[] = [];
+
     for (let j = 0; j < totalFiles; j++) {
       const jsonPath = res.json_paths[j];
       const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
@@ -295,11 +298,20 @@ export function App() {
       }
       srcMap[relativePath] = { uassetPath, jsonPath };
 
+      const prevCount = freshParams.length;
       try {
         const content = await tauri.readTextFile(jsonPath);
         const json = JSON.parse(content);
         parseJsonAndExtractColors(json, fileName, relativePath, freshParams, filterDictionary, debug.addLog);
       } catch (e) {}
+
+      if (freshParams.length === prevCount) {
+        unusedJsonPaths.push(jsonPath);
+        if (uassetPath) {
+          unusedUassetPaths.push(uassetPath);
+        }
+        delete srcMap[relativePath];
+      }
 
       // Yield every 30 files so V8 can run incremental GC and prevent memory spikes
       if (j > 0 && j % 30 === 0) {
@@ -307,9 +319,13 @@ export function App() {
       }
     }
 
+    if (unusedJsonPaths.length > 0 || unusedUassetPaths.length > 0) {
+      tauri.pruneUnusedHeroAssets(unusedJsonPaths, unusedUassetPaths).catch(() => {});
+    }
+
     tauri.logFrontendMessage(
       'INFO',
-      `[Hero ${heroId}] Done parsing: ${freshParams.length} color params across ${totalFiles} files`
+      `[Hero ${heroId}] Done parsing: ${freshParams.length} color params across ${totalFiles - unusedJsonPaths.length} active files (${unusedJsonPaths.length} unneeded pruned)`
     ).catch(() => {});
 
     return { srcMap, params: freshParams, originalFiles: {} };

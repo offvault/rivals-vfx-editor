@@ -267,3 +267,9 @@ export async function createBundleZip(bundleName: string, outputDir: string, fil
   console.debug('[tauri] Creating bundle zip:', bundleName, 'files:', filePaths.length);
   return invoke('create_bundle_zip', { bundleName, outputDir, filePaths });
 }
+
+export async function pruneUnusedHeroAssets(jsonPaths: string[], uassetPaths: string[]): Promise<number> {
+  console.debug('[tauri] Pruning unused hero assets: json =', jsonPaths.length, 'uasset =', uassetPaths.length);
+  return invoke('prune_unused_hero_assets', { jsonPaths, uassetPaths });
+}
+

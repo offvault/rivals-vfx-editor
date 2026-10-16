@@ -246,4 +246,8 @@ export interface UsmapStatus {
   needs_update: boolean;
   latest_remote: string | null;
   auto_managed: boolean;
+  current_build?: string | null;
+  latest_build?: string | null;
+  season?: string | null;
+  message?: string | null;
 }

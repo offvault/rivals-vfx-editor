@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { AppSettings, CacheInfo } from '@/types';
 import { ToggleSwitch } from '@/components/ui';
 import * as tauri from '@/services/tauri';
@@ -49,6 +49,10 @@ export function SettingsModal({
   onClearVfxCache,
   onClearManualCache,
 }: SettingsModalProps) {
+  const [isPullingUsmap, setIsPullingUsmap] = useState(false);
+  const [usmapMessage, setUsmapMessage] = useState<string | null>(null);
+  const [usmapMessageType, setUsmapMessageType] = useState<'success' | 'info' | 'error'>('info');
+
   const UI_SCALE_OPTIONS = [
     { value: 0.8, label: '80%' },
     { value: 0.9, label: '90%' },
@@ -57,6 +61,30 @@ export function SettingsModal({
     { value: 1.1, label: '110%' },
     { value: 1.25, label: '125%' },
   ];
+
+  const handlePullUsmap = async () => {
+    setIsPullingUsmap(true);
+    setUsmapMessage(null);
+    try {
+      const status = await tauri.fetchLatestUsmap();
+      if (status.file_path) {
+        setSettings(prev => ({ ...prev, usmapPath: status.file_path! }));
+      }
+      if (status.message) {
+        setUsmapMessage(status.message);
+        setUsmapMessageType('success');
+      } else {
+        setUsmapMessage('Updated successfully.');
+        setUsmapMessageType('success');
+      }
+    } catch (e: any) {
+      console.error('[SettingsModal] Failed to pull usmap:', e);
+      setUsmapMessage(e?.message || String(e));
+      setUsmapMessageType('error');
+    } finally {
+      setIsPullingUsmap(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: 'rgba(0,0,0,0.7)' }}>
@@ -102,21 +130,37 @@ export function SettingsModal({
               </button>
             </div>
             <button
-              onClick={async () => {
-                try {
-                  const status = await tauri.fetchLatestUsmap();
-                  if (status.file_path) {
-                    setSettings(prev => ({ ...prev, usmapPath: status.file_path! }));
-                  }
-                } catch (e) {
-                  console.error('[SettingsModal] Failed to pull usmap:', e);
-                }
-              }}
-              className="w-full mt-2 px-4 py-2 text-sm font-medium rounded-none"
+              onClick={handlePullUsmap}
+              disabled={isPullingUsmap}
+              className="w-full mt-2 px-4 py-2 text-sm font-medium rounded-none flex items-center justify-center gap-2 disabled:opacity-60 transition-colors"
               style={{ backgroundColor: 'var(--bg-2)', color: 'var(--text-2)' }}
             >
-              Pull Latest .usmap
+              {isPullingUsmap ? (
+                <>
+                  <svg className="animate-spin h-4 w-4 text-cyan-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+                  </svg>
+                  <span>Checking / Downloading .usmap...</span>
+                </>
+              ) : (
+                <span>Pull Latest .usmap</span>
+              )}
             </button>
+            {usmapMessage && (
+              <div
+                className={`mt-2 p-2 rounded text-xs font-mono flex items-center gap-2 ${
+                  usmapMessageType === 'error'
+                    ? 'bg-red-500/10 border border-red-500/30 text-red-300'
+                    : usmapMessageType === 'success'
+                    ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300'
+                    : 'bg-cyan-500/10 border border-cyan-500/30 text-cyan-300'
+                }`}
+              >
+                <span>{usmapMessageType === 'error' ? '✕' : '✓'}</span>
+                <span>{usmapMessage}</span>
+              </div>
+            )}
           </div>
 
           {/* Game Paks Path */}

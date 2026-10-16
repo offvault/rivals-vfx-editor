@@ -79,36 +79,29 @@ export function Header({
               </span>
             )}
           </div>
-        ) : (
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-emerald-500" />
-            <span className="text-xs font-mono font-medium tracking-wide uppercase" style={{ color: 'var(--text-3)' }}>
-              Workspace Ready
-            </span>
-          </div>
-        )}
+        ) : null}
       </div>
 
       {/* Right: Quick Action Controls & Console */}
       <div className="flex items-center gap-2">
-        {/* Prominent Live Console / Telemetry Logs Button */}
+        {/* Prominent Live Console Button */}
         {onOpenConsole && (
           <button
             type="button"
             onClick={onOpenConsole}
-            title="Open Live Diagnostic Console & Telemetry"
+            title="Open Live Diagnostic Console"
             className="flex items-center gap-1.5 px-3 py-1 text-xs font-mono font-bold rounded border transition-all hover:brightness-125 hover:shadow"
             style={{
-              backgroundColor: 'rgba(16, 185, 129, 0.12)',
-              borderColor: 'rgba(16, 185, 129, 0.4)',
-              color: '#34d399',
+              backgroundColor: 'rgba(6, 182, 212, 0.12)',
+              borderColor: 'rgba(6, 182, 212, 0.4)',
+              color: '#22d3ee',
             }}
           >
             <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="4 17 10 11 4 5" />
               <line x1="12" y1="19" x2="20" y2="19" />
             </svg>
-            <span>Console / Logs</span>
+            <span>Console</span>
           </button>
         )}
 

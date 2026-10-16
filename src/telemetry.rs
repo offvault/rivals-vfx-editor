@@ -167,30 +167,23 @@ pub fn start_telemetry_monitor() {
     let _ = std::thread::Builder::new()
         .name("rvfx-telemetry-daemon".to_string())
         .spawn(move || {
-            let mut tick: u64 = 0;
             loop {
+                if !is_telemetry_enabled() {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 if !is_telemetry_enabled() {
                     continue;
                 }
 
-                tick = tick.wrapping_add(1);
                 let snap = sample_telemetry();
 
-                // 1. High Memory Pressure Alerts (App RAM > 800 MB or System RAM > 85%)
+                // High Memory Pressure Alerts (App RAM > 800 MB or System RAM > 85%)
                 if snap.app_ram_mb >= 800 || snap.ram_percent >= 85.0 {
                     log_warn(format!(
                         "HIGH MEMORY PRESSURE ALERT: App RAM: {} MB | System RAM: {:.1}/{:.1} GB ({}%) | CPU: {:.0}%",
-                        snap.app_ram_mb,
-                        snap.used_ram_mb as f64 / 1024.0,
-                        snap.total_ram_mb as f64 / 1024.0,
-                        snap.ram_percent as u32,
-                        snap.cpu_percent
-                    ));
-                } else if tick % 15 == 0 {
-                    // 2. Periodic Heartbeat every ~30 seconds
-                    log_info(format!(
-                        "Heartbeat: App RAM: {} MB | System RAM: {:.1}/{:.1} GB ({}%) | CPU: {:.0}%",
                         snap.app_ram_mb,
                         snap.used_ram_mb as f64 / 1024.0,
                         snap.total_ram_mb as f64 / 1024.0,
@@ -223,7 +216,7 @@ pub fn init_logger() {
     start_telemetry_monitor();
 
     log_info(format!(
-        "Diagnostic Telemetry Logger initialized. Log directory: {}",
+        "Console Logger initialized. Log directory: {}",
         logs_dir.display()
     ));
 }

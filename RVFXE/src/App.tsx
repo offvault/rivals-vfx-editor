@@ -17,7 +17,7 @@ import {
   inferRecipeFromLegacySession,
   applyRecipeToParams,
 } from '@/utils/color';
-import { setNestedValue, getFileName, normalizePath, pathsMatchSuffix, getPakReadyRelativePath, toPascalCaseHeroName } from '@/utils/helpers';
+import { setNestedValue, getFileName, normalizePath, pathsMatchSuffix, getPakReadyRelativePath, toPascalCaseHeroName, formatCustomLabel } from '@/utils/helpers';
 import { parseJsonAndExtractColors } from '@/services/colorParser';
 import * as tauri from '@/services/tauri';
 import { Header } from '@/components/Header';
@@ -361,13 +361,16 @@ export function App() {
     if (selectedParams.size === 0) { alert('No parameters selected.'); return; }
     const newRgba = hexToRgba(masterColor);
 
-    setActiveRecipeTracker(prev => ({
-      ...prev,
-      mode: 'single',
-      masterColor,
-      preserveIntensity,
-      ignoreGrayscale,
-    }));
+    const isFullApplication = colorParams.length > 0 && selectedParams.size >= Math.floor(colorParams.length * 0.8);
+    if (isFullApplication) {
+      setActiveRecipeTracker(prev => ({
+        ...prev,
+        mode: 'single',
+        masterColor,
+        preserveIntensity,
+        ignoreGrayscale,
+      }));
+    }
 
     // Apply to current active slot
     const newParams = colorParams.map(p => {
@@ -781,26 +784,29 @@ export function App() {
 
         // Apply explicit sessionData overrides if provided
         if (slot.sessionData && slot.sessionData.length > 0) {
+          const sessionMap = new Map<string, RGBA>();
+          for (const e of slot.sessionData) {
+            if (e.rgba) {
+              sessionMap.set(`${normalizePath(e.relativePath)}::${e.paramName}`, e.rgba);
+              sessionMap.set(`${getFileName(e.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, '')}::${e.paramName}`, e.rgba);
+            }
+          }
           for (const param of slotParams) {
-            const paramNorm = normalizePath(param.relativePath);
-            const paramFileName = getFileName(param.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, '');
-            let match = slot.sessionData.find(e => normalizePath(e.relativePath) === paramNorm && e.paramName === param.paramName);
-            if (!match) match = slot.sessionData.find(e => pathsMatchSuffix(normalizePath(e.relativePath), paramNorm) && e.paramName === param.paramName);
-            if (!match) match = slot.sessionData.find(e => getFileName(e.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, '') === paramFileName && e.paramName === param.paramName);
-            if (match?.rgba) {
+            const exactKey = `${normalizePath(param.relativePath)}::${param.paramName}`;
+            const fileKey = `${getFileName(param.relativePath).toLowerCase().replace(/\.json$/i, '').replace(/\.uasset$/i, '')}::${param.paramName}`;
+            const matchRgba = sessionMap.get(exactKey) || sessionMap.get(fileKey);
+            if (matchRgba) {
               param.rgba = {
-                R: match.rgba.R ?? param.rgba.R,
-                G: match.rgba.G ?? param.rgba.G,
-                B: match.rgba.B ?? param.rgba.B,
-                A: match.rgba.A ?? param.rgba.A,
+                R: matchRgba.R ?? param.rgba.R,
+                G: matchRgba.G ?? param.rgba.G,
+                B: matchRgba.B ?? param.rgba.B,
+                A: matchRgba.A ?? param.rgba.A,
               };
             }
           }
         }
 
-        const cleanLabel = slot.customLabel.toLowerCase().includes('vfx')
-          ? `${toPascalCaseHeroName(slot.customLabel.replace(/_?vfx/i, ''))}_VFX`
-          : `${toPascalCaseHeroName(slot.customLabel)}_VFX`;
+        const cleanLabel = formatCustomLabel(slot.customLabel, slot.heroName);
 
         preparedSlots.push({
           slotId: slot.slotId,
@@ -1218,6 +1224,12 @@ export function App() {
             recipe: currentRecipe,
             slots: options.slots.map((sc: ExportSlotConfig) => {
               const origSlot = batchSlots.find(s => s.slotId === sc.slotId);
+              const slotParams = origSlot ? origSlot.colorParams : colorParams;
+              const slotData: SessionEntry[] = slotParams.map(p => ({
+                relativePath: p.relativePath.replace(/\.json$/i, ''),
+                paramName: p.paramName,
+                rgba: p.rgba,
+              }));
               return {
                 slotId: sc.slotId,
                 heroId: sc.heroId,
@@ -1225,6 +1237,7 @@ export function App() {
                 customLabel: sc.customLabel,
                 bundleGroup: sc.exportMode === 'bundle' ? sc.bundleGroup : undefined,
                 recipe: origSlot?.recipe || currentRecipe,
+                sessionData: slotData,
               };
             }),
             savedParameters: [],

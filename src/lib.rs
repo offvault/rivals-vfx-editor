@@ -4456,11 +4456,6 @@ async fn package_iostore_mod(
                 zip_entries.push((pak_file.clone(), pak_file.file_name().unwrap().to_string_lossy().to_string()));
             }
 
-            let rvfxp_candidate = output_dir_path.join(format!("{}.rvfxp", mod_name));
-            if rvfxp_candidate.exists() {
-                zip_entries.push((rvfxp_candidate.clone(), format!("{}.rvfxp", mod_name)));
-            }
-
             if !zip_entries.is_empty() {
                 if let Ok(_) = create_zip_archive(&zip_path, &zip_entries) {
                     result.zip_path = Some(zip_path.to_string_lossy().to_string());

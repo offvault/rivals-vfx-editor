@@ -6,6 +6,9 @@ export interface DiagnosticConsoleModalProps {
   onClose: () => void;
 }
 
+const MODAL_WIDTH = 720;
+const MODAL_HEIGHT = 480;
+
 export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps) {
   const [logs, setLogs] = useState<string[]>([]);
   const [telemetry, setTelemetry] = useState<TelemetrySnapshot | null>(null);
@@ -13,12 +16,13 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
   const [autoScroll, setAutoScroll] = useState(true);
   const logContainerRef = useRef<HTMLDivElement>(null);
 
-  // Floating draggable position state
+  // Floating draggable position state bounded within viewport
   const [position, setPosition] = useState<{ x: number; y: number }>(() => {
     const w = typeof window !== 'undefined' ? window.innerWidth : 1200;
+    const maxX = Math.max(12, w - MODAL_WIDTH - 20);
     return {
-      x: Math.max(20, w - 790),
-      y: 55,
+      x: maxX,
+      y: 50,
     };
   });
   const isDraggingRef = useRef(false);
@@ -51,7 +55,7 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
     }
   }, [logs, autoScroll]);
 
-  // Mouse drag listeners
+  // Mouse drag listeners with strict viewport bounds so the modal never cuts off
   const handleMouseDown = (e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest('button, input, a, label')) return;
     isDraggingRef.current = true;
@@ -64,8 +68,13 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
       if (!isDraggingRef.current) return;
-      const newX = Math.max(10, Math.min(window.innerWidth - 300, e.clientX - dragOffsetRef.current.x));
-      const newY = Math.max(10, Math.min(window.innerHeight - 80, e.clientY - dragOffsetRef.current.y));
+      const minX = 8;
+      const maxX = Math.max(minX, window.innerWidth - MODAL_WIDTH - 8);
+      const minY = 8;
+      const maxY = Math.max(minY, window.innerHeight - MODAL_HEIGHT - 8);
+
+      const newX = Math.max(minX, Math.min(maxX, e.clientX - dragOffsetRef.current.x));
+      const newY = Math.max(minY, Math.min(maxY, e.clientY - dragOffsetRef.current.y));
       setPosition({ x: newX, y: newY });
     };
 
@@ -79,6 +88,24 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
+  }, []);
+
+  // Handle window resize so modal never gets stranded outside the window
+  useEffect(() => {
+    const handleResize = () => {
+      setPosition(prev => {
+        const minX = 8;
+        const maxX = Math.max(minX, window.innerWidth - MODAL_WIDTH - 8);
+        const minY = 8;
+        const maxY = Math.max(minY, window.innerHeight - MODAL_HEIGHT - 8);
+        return {
+          x: Math.max(minX, Math.min(maxX, prev.x)),
+          y: Math.max(minY, Math.min(maxY, prev.y)),
+        };
+      });
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
   }, []);
 
   const handleOpenLogFolder = async () => {
@@ -115,42 +142,56 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
   }, [onClose]);
 
   return (
-    <div className="fixed inset-0 pointer-events-none z-[100] overflow-hidden select-none">
+    <div className="fixed inset-0 pointer-events-none z-[100] select-none">
       <div
-        className="pointer-events-auto absolute flex flex-col border border-cyan-500/40 shadow-2xl overflow-hidden font-mono text-xs rounded-lg"
+        className="pointer-events-auto absolute flex flex-col border shadow-2xl font-mono text-xs"
         style={{
-          width: '760px',
-          height: '520px',
+          width: `${MODAL_WIDTH}px`,
+          height: `${MODAL_HEIGHT}px`,
+          maxWidth: 'calc(100vw - 16px)',
+          maxHeight: 'calc(100vh - 16px)',
           left: `${position.x}px`,
           top: `${position.y}px`,
-          backgroundColor: '#070b10',
-          boxShadow: '0 20px 50px rgba(0, 0, 0, 0.85), 0 0 20px rgba(6, 182, 212, 0.15)',
+          backgroundColor: 'var(--bg-3)',
+          borderColor: 'var(--bg-1)',
+          boxShadow: '0 20px 50px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(255, 255, 255, 0.08)',
         }}
       >
         {/* Draggable Terminal Header */}
         <div
           onMouseDown={handleMouseDown}
-          className="px-3 py-2 border-b border-cyan-950 flex justify-between items-center flex-shrink-0 cursor-move bg-[#0b131c]"
+          className="px-3.5 py-2 border-b flex justify-between items-center flex-shrink-0 cursor-move"
+          style={{
+            backgroundColor: 'var(--bg-2)',
+            borderColor: 'var(--bg-1)',
+          }}
         >
-          <div className="flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-[0_0_8px_#22d3ee] animate-pulse" />
-            <h2 className="text-xs font-bold tracking-widest uppercase text-cyan-200">
-              Console
+          <div className="flex items-center gap-2.5">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_6px_#34d399]" />
+            <h2 className="text-xs font-bold tracking-widest uppercase" style={{ color: 'var(--text-1)' }}>
+              Console Telemetry
             </h2>
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-950/80 text-cyan-400 border border-cyan-800/40">
+            <span
+              className="text-[10px] px-1.5 py-0.5 border"
+              style={{
+                backgroundColor: 'var(--bg-4)',
+                borderColor: 'var(--bg-1)',
+                color: 'var(--text-3)',
+              }}
+            >
               Live
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
             <button
               onClick={handleOpenLogFolder}
               title="Open persistent Logs directory on disk"
-              className="flex items-center gap-1.5 px-2 py-0.5 text-[11px] font-semibold rounded border transition-colors hover:bg-cyan-500/20"
+              className="flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium border transition-colors hover:bg-white/10"
               style={{
-                backgroundColor: 'rgba(6, 182, 212, 0.12)',
-                borderColor: 'rgba(6, 182, 212, 0.35)',
-                color: '#22d3ee',
+                backgroundColor: 'var(--bg-1)',
+                borderColor: 'var(--bg-1)',
+                color: 'var(--text-2)',
               }}
             >
               <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -162,8 +203,12 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
             <button
               onClick={handleCopy}
               disabled={logs.length === 0}
-              className="px-2 py-0.5 text-[11px] font-semibold rounded border transition-colors hover:bg-white/10 text-gray-300 disabled:opacity-40"
-              style={{ backgroundColor: '#131b24', borderColor: '#1f2e3d' }}
+              className="px-2.5 py-1 text-[11px] font-medium border transition-colors hover:bg-white/10 disabled:opacity-40"
+              style={{
+                backgroundColor: 'var(--bg-1)',
+                borderColor: 'var(--bg-1)',
+                color: 'var(--text-2)',
+              }}
             >
               {isCopied ? '✓ Copied' : 'Copy'}
             </button>
@@ -171,8 +216,12 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
             <button
               onClick={handleClear}
               disabled={logs.length === 0}
-              className="px-2 py-0.5 text-[11px] font-semibold rounded border transition-colors hover:bg-white/10 text-gray-400 hover:text-white disabled:opacity-40"
-              style={{ backgroundColor: '#131b24', borderColor: '#1f2e3d' }}
+              className="px-2.5 py-1 text-[11px] font-medium border transition-colors hover:bg-white/10 disabled:opacity-40"
+              style={{
+                backgroundColor: 'var(--bg-1)',
+                borderColor: 'var(--bg-1)',
+                color: 'var(--text-3)',
+              }}
             >
               Clear
             </button>
@@ -180,7 +229,7 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
             <button
               onClick={onClose}
               title="Close Console"
-              className="p-1 rounded text-gray-400 hover:text-red-400 transition-colors"
+              className="w-6 h-6 flex items-center justify-center transition-colors hover:bg-red-500/20 text-gray-400 hover:text-red-400 ml-1"
             >
               ✕
             </button>
@@ -189,25 +238,29 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
 
         {/* Real-time Telemetry Dashboard Bar */}
         <div
-          className="px-3 py-1.5 border-b border-cyan-950 flex flex-wrap items-center justify-between text-[11px] flex-shrink-0 bg-[#090e15]"
+          className="px-3.5 py-1.5 border-b flex flex-wrap items-center justify-between text-[11px] flex-shrink-0"
+          style={{
+            backgroundColor: 'var(--bg-4)',
+            borderColor: 'var(--bg-2)',
+          }}
         >
           {telemetry ? (
-            <div className="flex flex-wrap items-center gap-3.5">
+            <div className="flex flex-wrap items-center gap-4">
               <div className="flex items-center gap-1.5">
-                <span className="text-gray-500">Sys RAM:</span>
-                <span className="font-semibold text-cyan-300">
+                <span style={{ color: 'var(--text-4)' }}>Sys RAM:</span>
+                <span className="font-semibold" style={{ color: 'var(--text-1)' }}>
                   {(telemetry.used_ram_mb / 1024).toFixed(1)} / {(telemetry.total_ram_mb / 1024).toFixed(1)} GB
                 </span>
-                <span className="text-[10px] text-gray-400">({Math.round(telemetry.ram_percent)}%)</span>
+                <span className="text-[10px]" style={{ color: 'var(--text-4)' }}>({Math.round(telemetry.ram_percent)}%)</span>
               </div>
 
               <div className="flex items-center gap-1.5">
-                <span className="text-gray-500">App RAM:</span>
+                <span style={{ color: 'var(--text-4)' }}>App RAM:</span>
                 <span className="font-semibold text-emerald-400">{telemetry.app_ram_mb} MB</span>
               </div>
 
               <div className="flex items-center gap-1.5">
-                <span className="text-gray-500">CPU:</span>
+                <span style={{ color: 'var(--text-4)' }}>CPU:</span>
                 <span
                   className="font-semibold"
                   style={{
@@ -224,7 +277,7 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
               </div>
             </div>
           ) : (
-            <span className="text-gray-500 text-[11px]">Telemetry standby...</span>
+            <span className="text-[11px]" style={{ color: 'var(--text-4)' }}>Telemetry standby...</span>
           )}
 
           <div className="flex items-center gap-2">
@@ -233,9 +286,9 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
                 type="checkbox"
                 checked={autoScroll}
                 onChange={(e) => setAutoScroll(e.target.checked)}
-                className="cursor-pointer accent-cyan-500"
+                className="cursor-pointer"
               />
-              <span className="text-[10px]">Auto-scroll</span>
+              <span className="text-[10px]" style={{ color: 'var(--text-3)' }}>Auto-scroll</span>
             </label>
           </div>
         </div>
@@ -243,12 +296,13 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
         {/* Log Output */}
         <div
           ref={logContainerRef}
-          className="flex-1 p-2.5 overflow-y-auto space-y-0.5 text-[11px] select-text font-mono bg-[#05080c]"
+          className="flex-1 p-3 overflow-y-auto space-y-1 text-[11px] select-text font-mono"
+          style={{ backgroundColor: 'var(--bg-4)' }}
         >
           {logs.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-gray-600">
+            <div className="flex flex-col items-center justify-center h-full" style={{ color: 'var(--text-4)' }}>
               <p>No log messages recorded yet.</p>
-              <p className="text-[10px] mt-1 text-gray-700">Editor operations will stream telemetry logs here.</p>
+              <p className="text-[10px] mt-1 opacity-70">Editor operations will stream telemetry logs here.</p>
             </div>
           ) : (
             logs.map((log, i) => {
@@ -262,13 +316,13 @@ export function DiagnosticConsoleModal({ onClose }: DiagnosticConsoleModalProps)
                 : isWarn
                 ? '#fbbf24'
                 : isDebug
-                ? '#94a3b8'
+                ? 'var(--text-4)'
                 : isInfo
-                ? '#22d3ee'
-                : '#cbd5e1';
+                ? 'var(--text-1)'
+                : 'var(--text-2)';
 
               return (
-                <div key={i} className="leading-snug whitespace-pre-wrap break-all" style={{ color: textColor }}>
+                <div key={i} className="leading-relaxed whitespace-pre-wrap break-all" style={{ color: textColor }}>
                   {log}
                 </div>
               );
